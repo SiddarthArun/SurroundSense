@@ -96,6 +96,21 @@ splits will be incomplete). Each stage is idempotent: re-running stage 1 replace
 its own windows and manifest rows, stage 2 replaces only `source=own` rows, and
 stage 3 reuses the cached features.
 
+### Try the trained model
+
+```bash
+python demo.py                                   # built-in synthetic sounds (no dataset needed)
+python demo.py siren --detail                    # one sound, every class probability
+python demo.py --file audio/5-218980-A-30.wav    # a real clip, second by second
+python demo.py --file audio/5-218980-A-30.wav --model both   # float vs int8
+python demo.py --file take.wav --mix --threshold 0.6         # your own recording
+```
+
+`demo.py` loads `artifacts/model_int8.tflite` (the firmware model), shows the top
+classes per 1 s window, matches ESC-50 clips against `meta/esc50.csv` to display the
+true label and split, and counts detections above `--threshold`. Synthetic presets
+are illustrative only - real recordings are the faithful check.
+
 ### Own recordings
 
 ```
