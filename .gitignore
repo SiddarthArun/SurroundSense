@@ -7,3 +7,6 @@ __pycache__/
 data/processed/
 data/features/
 artifacts/
+# Ignore libraries
+libraries/*
+!libraries/protocol/
