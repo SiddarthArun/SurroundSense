@@ -7,11 +7,11 @@
 // in PDM mode, so it can only ever read data line 0 (mics 1 and 2).
 //
 // Bring-up order:
-//   1. Wire mics 1-2 only. TEXT_MODE 1, PDM_LINES 1. Upload, open Serial Monitor,
-//      tap each mic: only its meter should jump. Rate should read about 64000 B/s (2 ch).
-//   2. Wire mics 3-4. PDM_LINES 2. Rate should read about 128000 B/s (4 ch).
-//   3. If a tap shows on the wrong meter, fix SLOT_FOR_MIC below.
-//   4. TEXT_MODE 0. Upload, CLOSE the Serial Monitor, run host/recorder.py.
+//   1. TEXT_MODE 1. Upload, open Serial Monitor, snap fingers next to each mic in turn:
+//      only its meter should jump. Rate should read about 128000 B/s (4 ch).
+//   2. If a snap shows on the wrong meter, fix SLOT_FOR_MIC below.
+//   3. TEXT_MODE 0. Upload, CLOSE the Serial Monitor, run host/recorder.py.
+//   4. Still dropping blocks? STREAM_CHANNELS 1 sends mic 1 only (recorder.py --channels 1).
 //
 // Wiring (all mics: 3V -> 3V3, GND -> GND):
 //   Mic 1: CLK D0, DAT D1, SEL GND     Mic 2: CLK D0, DAT D1, SEL 3V3
@@ -21,9 +21,11 @@
 #include <protocol.h>
 
 // ---------- settings ----------
-#define TEXT_MODE   0   // 1: readable levels in Serial Monitor. 0: binary stream for recorder.py
-#define PDM_LINES   2   // 1: mics 1-2 (D1 only). 2: all four mics (D1 + D3)
-#define GAIN_SHIFT  1   // digital gain, each step doubles. Raise (1-4) if levels stay tiny
+#define TEXT_MODE       0   // 1: readable levels in Serial Monitor. 0: binary stream for recorder.py
+#define PDM_LINES       2   // 1: mics 1-2 (D1 only). 2: all four mics (D1 + D3)
+#define STREAM_CHANNELS 1   // binary mode: 4 = every mic, 1 = mic 1 only (a quarter of the USB
+                            // traffic; enough for training clips, recorder.py --channels 1)
+#define GAIN_SHIFT      1   // digital gain, each step doubles. Raise (1-4) if levels stay tiny
 
 #define PIN_PDM_CLK   1   // D0 (GPIO1): shared clock to every mic
 #define PIN_PDM_DAT0  2   // D1 (GPIO2): mics 1 and 2
@@ -33,12 +35,18 @@ constexpr int    CH          = PDM_LINES * 2;
 constexpr int    FRAMES      = AUDIO_FRAMES_PER_BLOCK;          // 256 frames = 16 ms
 constexpr size_t BLOCK_BYTES = FRAMES * CH * sizeof(int16_t);
 
-// Which slot in the driver's output holds each mic. Fix with the tap test if needed.
+// Which slot in the driver's output holds each mic. The driver puts the right-hand mic
+// (SEL = 3V3) of each pair first, so mic 1 is slot 1. Confirm with the tap test.
 #if PDM_LINES == 2
-const uint8_t SLOT_FOR_MIC[CH] = {0, 1, 2, 3};
+const uint8_t SLOT_FOR_MIC[CH] = {1, 0, 3, 2};
 #else
-const uint8_t SLOT_FOR_MIC[CH] = {0, 1};
+const uint8_t SLOT_FOR_MIC[CH] = {1, 0};
 #endif
+
+#if STREAM_CHANNELS != 1 && STREAM_CHANNELS != (PDM_LINES * 2)
+#error "STREAM_CHANNELS must be 1 or equal to the number of mics (PDM_LINES * 2)"
+#endif
+constexpr size_t PAYLOAD_BYTES = FRAMES * STREAM_CHANNELS * sizeof(int16_t);
 
 i2s_chan_handle_t rxChan = nullptr;
 int16_t  raw[FRAMES * CH];      // as read from the driver
@@ -58,6 +66,10 @@ void fail() {
 
 bool startMics() {
   i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);  // PDM RX is I2S0 only
+  // Deeper DMA buffering (8 x 480 frames = 240 ms) so a short USB stall doesn't lose audio.
+  // Each DMA buffer must stay under 4092 bytes: 480 frames x 4 slots x 2 bytes = 3840.
+  chanCfg.dma_desc_num = 8;
+  chanCfg.dma_frame_num = 480;
   if (i2s_new_channel(&chanCfg, nullptr, &rxChan) != ESP_OK) return false;
 
   i2s_pdm_rx_config_t cfg = {
@@ -95,7 +107,7 @@ bool startMics() {
 
 void setup() {
   Serial.setTxBufferSize(8192);   // room for a few blocks
-  Serial.setTxTimeoutMs(10);      // never stall long if the laptop stops reading
+  Serial.setTxTimeoutMs(50);      // ride out short USB stalls; the 240 ms DMA buffer covers the wait
   Serial.begin(115200);           // baud is ignored on native USB
 
   if (!startMics()) fail();
@@ -166,15 +178,25 @@ void textReport() {
 }
 #else
 // Header from protocol.h: A5 5A, type, seq (uint16 LE), payload length (uint16 LE), then samples.
+// Header and samples go out in one write, so a frame is never split between two writes.
+uint8_t frameBuf[7 + PAYLOAD_BYTES];
+
 void sendBlock() {
   if (!Serial) return;   // no laptop connected: skip, keep capturing
-  const uint8_t hdr[7] = {
-    FRAME_MAGIC_0, FRAME_MAGIC_1, FRAME_TYPE_AUDIO,
-    (uint8_t)(seq & 0xFF), (uint8_t)(seq >> 8),
-    (uint8_t)(BLOCK_BYTES & 0xFF), (uint8_t)(BLOCK_BYTES >> 8)
-  };
-  Serial.write(hdr, sizeof(hdr));
-  Serial.write((const uint8_t *)block, BLOCK_BYTES);
+  frameBuf[0] = FRAME_MAGIC_0;
+  frameBuf[1] = FRAME_MAGIC_1;
+  frameBuf[2] = FRAME_TYPE_AUDIO;
+  frameBuf[3] = (uint8_t)(seq & 0xFF);
+  frameBuf[4] = (uint8_t)(seq >> 8);
+  frameBuf[5] = (uint8_t)(PAYLOAD_BYTES & 0xFF);
+  frameBuf[6] = (uint8_t)(PAYLOAD_BYTES >> 8);
+#if STREAM_CHANNELS == 1
+  int16_t *out = (int16_t *)(frameBuf + 7);
+  for (int f = 0; f < FRAMES; f++) out[f] = block[f * CH];   // mic 1 only
+#else
+  memcpy(frameBuf + 7, block, PAYLOAD_BYTES);
+#endif
+  Serial.write(frameBuf, sizeof(frameBuf));
 }
 #endif
 
