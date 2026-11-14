@@ -10,7 +10,10 @@ small and demo-focused.
   Training reads only `data/processed/manifest.csv` and `config.yaml`.
 - `libraries/protocol/protocol.h`: shared constants, `msg_t` (10 bytes), class list.
   Sketches use `#include <protocol.h>`; the Arduino sketchbook location is the repo root.
-- `room_capture/`: room unit firmware. `sense_hello/`, `esp01_hello/`: bring-up sketches.
+- `libraries/microfrontend/`: TensorFlow audio microfrontend C code (vendored; uses the core's kissfft).
+- `room_capture/`: room unit firmware. `MODE` picks stream / levels / on-device inference
+  (`yam_infer.h`, needs `model.h` from `export.py --firmware-dir room_capture`).
+  `sense_hello/`, `esp01_hello/`: bring-up sketches.
 - `host/recorder.py`: records the room unit's stream into `my_recordings_raw/<label>/`.
 
 ## Hardware facts

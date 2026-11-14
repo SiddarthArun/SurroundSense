@@ -217,6 +217,11 @@ accuracy is more than 3 points below float.
    the C frontend's noise-reduction and gain stages carry state across frames.
 5. `python export.py --firmware-dir room_capture` also copies `model.h` into the sketch
    folder, since `artifacts/` is gitignored.
+6. All of the above is implemented in `room_capture/yam_infer.h`. To run it, set
+   `MODE MODE_INFER` in `room_capture.ino`. The microfrontend is the same C code the
+   TensorFlow op runs, copied into `libraries/microfrontend/` with its settings pinned to
+   the op's (PCAN on: the Python wrapper's default). TFLite Micro comes with the esp32
+   Arduino core 3.x, so nothing extra needs installing. Steps: `INSTRUCTIONS.md`.
 
 ## Tests
 

@@ -12,3 +12,4 @@ my_recordings_raw/
 # Ignore libraries
 libraries/*
 !libraries/protocol/
+!libraries/microfrontend/

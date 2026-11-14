@@ -1,5 +1,5 @@
-// room_capture: XIAO ESP32S3 Sense with 4 PDM mics, streaming audio to the laptop over USB.
-// Build plan Step 1.
+// room_capture: XIAO ESP32S3 Sense with 4 PDM mics. Streams audio to the laptop over USB,
+// or classifies it on the device (MODE_INFER).
 //
 // Tools menu: Board "XIAO_ESP32S3" | USB CDC On Boot "Enabled" | PSRAM "OPI PSRAM"
 //
@@ -7,11 +7,14 @@
 // in PDM mode, so it can only ever read data line 0 (mics 1 and 2).
 //
 // Bring-up order:
-//   1. TEXT_MODE 1. Upload, open Serial Monitor, snap fingers next to each mic in turn:
+//   1. MODE_LEVELS. Upload, open Serial Monitor, snap fingers next to each mic in turn:
 //      only its meter should jump. Rate should read about 128000 B/s (4 ch).
 //   2. If a snap shows on the wrong meter, fix SLOT_FOR_MIC below.
-//   3. TEXT_MODE 0. Upload, CLOSE the Serial Monitor, run host/recorder.py.
+//   3. MODE_STREAM. Upload, CLOSE the Serial Monitor, run host/recorder.py.
 //   4. Still dropping blocks? STREAM_CHANNELS 1 sends mic 1 only (recorder.py --channels 1).
+//   5. MODE_INFER. Train, then `python export.py --firmware-dir room_capture` (writes model.h
+//      here). Upload, open Serial Monitor: probabilities every 0.5 s, Event lines on a
+//      detection. Settings at the top of yam_infer.h.
 //
 // Wiring (all mics: 3V -> 3V3, GND -> GND):
 //   Mic 1: CLK D0, DAT D1, SEL GND     Mic 2: CLK D0, DAT D1, SEL 3V3
@@ -21,7 +24,10 @@
 #include <protocol.h>
 
 // ---------- settings ----------
-#define TEXT_MODE       0   // 1: readable levels in Serial Monitor. 0: binary stream for recorder.py
+#define MODE_STREAM     0   // binary audio stream for host/recorder.py
+#define MODE_LEVELS     1   // readable level meters in Serial Monitor
+#define MODE_INFER      2   // on-device classifier, text results in Serial Monitor
+#define MODE            MODE_INFER
 #define PDM_LINES       2   // 1: mics 1-2 (D1 only). 2: all four mics (D1 + D3)
 #define STREAM_CHANNELS 4   // binary mode: 4 = every mic, 1 = mic 1 only (a quarter of the USB
                             // traffic; enough for training clips, recorder.py --channels 1)
@@ -47,6 +53,10 @@ const uint8_t SLOT_FOR_MIC[CH] = {1, 0};
 #error "STREAM_CHANNELS must be 1 or equal to the number of mics (PDM_LINES * 2)"
 #endif
 constexpr size_t PAYLOAD_BYTES = FRAMES * STREAM_CHANNELS * sizeof(int16_t);
+
+#if MODE == MODE_INFER
+#include "yam_infer.h"   // classifier; needs model.h from export.py --firmware-dir room_capture
+#endif
 
 i2s_chan_handle_t rxChan = nullptr;
 int16_t  raw[FRAMES * CH];      // as read from the driver
@@ -110,6 +120,11 @@ void setup() {
   Serial.setTxTimeoutMs(50);      // ride out short USB stalls; the 240 ms DMA buffer covers the wait
   Serial.begin(115200);           // baud is ignored on native USB
 
+#if MODE == MODE_INFER
+  const uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) delay(10);   // give the Serial Monitor a moment
+  inferSetup();
+#endif
   if (!startMics()) fail();
 }
 
@@ -130,7 +145,7 @@ void processBlock() {
   }
 }
 
-#if TEXT_MODE
+#if MODE == MODE_LEVELS
 double   sumSq[CH];
 int32_t  peak[CH];
 uint32_t framesSince = 0;
@@ -176,7 +191,7 @@ void textReport() {
   bytesSince = 0;
   lastPrint = now;
 }
-#else
+#elif MODE == MODE_STREAM
 // Header from protocol.h: A5 5A, type, seq (uint16 LE), payload length (uint16 LE), then samples.
 // Header and samples go out in one write, so a frame is never split between two writes.
 uint8_t frameBuf[7 + PAYLOAD_BYTES];
@@ -206,7 +221,9 @@ void loop() {
     return;   // timeout or partial read: drop it
   }
   processBlock();
-#if TEXT_MODE
+#if MODE == MODE_INFER
+  inferPushBlock(block, FRAMES, CH);
+#elif MODE == MODE_LEVELS
   textReport();
 #else
   sendBlock();
