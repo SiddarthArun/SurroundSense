@@ -99,8 +99,7 @@ def find_recordings(raw_dir: Path) -> tuple[dict[str, list[Path]], list[Path]]:
 def safe_file_id(path: Path, raw_dir: Path) -> str:
     """Unique, filesystem-safe id from the recording's path inside the raw folder."""
     relative = path.relative_to(raw_dir).with_suffix("")
-    parts = [part for part in relative.parts]
-    identifier = "__".join(parts)
+    identifier = "__".join(relative.parts)
     cleaned = "".join(
         character if (character.isalnum() or character in "-_.") else "_" for character in identifier
     )

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Record the room unit's mic stream to a WAV file (build plan Step 1).
+"""Record the room unit's mic stream to a WAV file.
 
 Setup:   pip install -r requirements.txt     (needs pyserial and numpy)
 Usage:   python host/recorder.py --port COM11 --label knock --seconds 10
          python host/recorder.py --port COM11 --seconds 0        # until Ctrl+C
          python host/recorder.py --port COM11 --channels 2       # while only mics 1-2 are wired
 
-The Sense must run room_capture with TEXT_MODE 0, and the Arduino Serial Monitor must be closed.
+The Sense must run room_capture with MODE MODE_STREAM, and the Arduino Serial Monitor must be closed.
 Saves my_recordings_raw/<label>/<label>_<timestamp>.wav at the repo root (16 kHz, 16-bit,
 one channel per mic, mic 1 = channel 0), ready for scripts/convert_recordings.py.
 """
@@ -136,7 +136,7 @@ def main():
 
             now = time.time()
             if total == 0 and now - start > 3:
-                print("No audio frames yet: flash room_capture with TEXT_MODE 0 and close the Serial Monitor.")
+                print("No audio frames yet: flash room_capture with MODE_STREAM and close the Serial Monitor.")
                 start = now
             if meter and now - last_print >= 0.5:
                 x = np.concatenate(meter).astype(np.float64)

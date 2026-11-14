@@ -95,7 +95,7 @@ def load_manifest_rows(cfg: dict) -> list[dict]:
     return rows
 
 
-def split_rows(cfg: dict, rows: list[dict]) -> dict[str, list[dict]]:
+def split_rows(rows: list[dict]) -> dict[str, list[dict]]:
     splits = {name: [row for row in rows if row["split"] == name] for name in manifest.SPLIT_NAMES}
     for name, split_rows_ in splits.items():
         if not split_rows_:
@@ -196,7 +196,7 @@ def evaluate(model, x_test, y_test, labels: list[str], background_index: int):
     overall = metrics.accuracy(matrix)
     per_class = metrics.per_class_metrics(matrix, labels)
     fpr = metrics.false_positive_rate_background(matrix, background_index)
-    return matrix, overall, per_class, fpr, predictions
+    return matrix, overall, per_class, fpr
 
 
 def print_report(matrix, overall, per_class, fpr, labels, background_index) -> None:
@@ -269,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     background = cfg["classes"]["background"]
     background_index = label_index.get(background)
 
-    splits = split_rows(cfg, rows)
+    splits = split_rows(rows)
     train_classes = {row["class"] for row in splits["train"]}
     absent = [label for label in labels if label not in train_classes]
     if absent:
@@ -312,13 +312,12 @@ def main(argv: list[str] | None = None) -> int:
         len(labels),
         float(cfg["training"]["max_class_weight"]),
     )
-    weights_by_label = class_weights
     print(
         "class weights: "
         + ", ".join(f"{labels[i]}={class_weights[i]:.2f}" for i in range(len(labels)))
     )
 
-    train_ds = make_dataset(tf, train_items, cfg["features"]["input_shape"], weights_by_label, cfg, True)
+    train_ds = make_dataset(tf, train_items, cfg["features"]["input_shape"], class_weights, cfg, True)
     val_weights = np.ones(len(y_val), dtype=np.float32)
 
     # --- model -------------------------------------------------------------
@@ -365,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"saved Keras model: {best_model_path}")
 
     # --- evaluation --------------------------------------------------------
-    matrix, overall, per_class, fpr, _ = evaluate(
+    matrix, overall, per_class, fpr = evaluate(
         model, x_test, y_test, labels, background_index if background_index is not None else 0
     )
     print_report(matrix, overall, per_class, fpr, labels, background_index)

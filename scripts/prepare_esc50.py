@@ -10,7 +10,7 @@
 * writes ``data/processed/manifest.csv`` (folds 1-3 train / 4 val / 5 test),
   preserving rows written by stage 2 (own recordings)
 
-The dataset in ``yamDetector/audio`` + ``yamDetector/meta`` is read-only here.
+The dataset in ``data/ESC-50/`` is read-only here.
 """
 
 from __future__ import annotations

@@ -21,7 +21,6 @@ SPLIT_NAMES = ("train", "val", "test")
 
 # Dataset layouts tried in order when the configured ESC-50 paths do not exist.
 _ESC50_CANDIDATES = (
-    ("audio", "meta/esc50.csv"),
     ("data/ESC-50/audio", "data/ESC-50/meta/esc50.csv"),
     ("ESC-50/audio", "ESC-50/meta/esc50.csv"),
 )
@@ -183,9 +182,6 @@ def load_config(path: str | Path | None = None) -> dict:
     features["input_shape"] = (n_frames, channels, 1)
     features["lower_band_limit_hz"] = float(features.get("lower_band_limit_hz", 125.0))
     features["upper_band_limit_hz"] = float(features.get("upper_band_limit_hz", 7500.0))
-    features["output_scale_shift"] = float(features.get("output_scale_shift", 0.0))
-    features["left_context"] = bool(features.get("left_context", True))
-    features["right_context"] = bool(features.get("right_context", True))
     features["value_scale"] = float(features.get("value_scale", 255.0))
     if features["value_scale"] <= 0:
         raise ConfigError("config.yaml: 'features.value_scale' must be > 0")

@@ -55,19 +55,12 @@ def signature(cfg: dict) -> str:
         features["step_ms"],
         features["lower_band_limit_hz"],
         features["upper_band_limit_hz"],
-        features["output_scale_shift"],
-        int(features["left_context"]),
-        int(features["right_context"]),
         features["value_scale"],
         audio["sample_rate"],
         audio["window_samples"],
     ]
     digest = hashlib.sha1("|".join(str(part) for part in parts).encode("utf-8")).hexdigest()
     return digest[:10]
-
-
-def frames_for_window(cfg: dict) -> int:
-    return int(cfg["features"]["n_frames"])
 
 
 def microfrontend(waves: np.ndarray, cfg: dict) -> np.ndarray:
@@ -91,7 +84,7 @@ def microfrontend(waves: np.ndarray, cfg: dict) -> np.ndarray:
 
     frontend = _load_op()
     features = cfg["features"]
-    out_frames = frames_for_window(cfg)
+    out_frames = int(features["n_frames"])
     out_channels = int(features["channels"])
     value_scale = float(features["value_scale"])
 

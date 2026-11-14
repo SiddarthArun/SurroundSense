@@ -4,12 +4,9 @@
 # (the directory containing this file) unless they are absolute.
 
 paths:
-  # ESC-50 dataset root: a folder with audio/ and meta/esc50.csv.
-  # In this repo the clips live in audio/ and meta/esc50.csv at the repo root.
-  # The public layout (data/ESC-50/audio + data/ESC-50/meta/esc50.csv) is
-  # auto-detected too; set these explicitly if neither matches.
-  esc50_audio_dir: audio
-  esc50_meta_csv: meta/esc50.csv
+  # ESC-50 dataset, committed to this repo (read-only)
+  esc50_audio_dir: data/ESC-50/audio
+  esc50_meta_csv: data/ESC-50/meta/esc50.csv
 
   # Stage 2 input: my_recordings_raw/<class>/<recording>.wav (any rate/channels)
   raw_recordings_dir: my_recordings_raw
@@ -83,9 +80,6 @@ features:
   step_ms: 20
   lower_band_limit_hz: 125.0
   upper_band_limit_hz: 7500.0
-  output_scale_shift: 0.0
-  left_context: true
-  right_context: true
   # Cached features are the op's log-scaled values divided by this number:
   # roughly 0-2.6 with a mean near 1 (8-bit frontend dynamic range). The
   # firmware must apply the same division before quantizing the input.

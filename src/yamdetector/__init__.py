@@ -6,4 +6,4 @@ stage 3 (train.py) and stage 4 (export.py) only ever read that folder plus
 config.yaml.
 """
 
-__all__ = ["audio", "config", "features", "manifest", "model"]
+__all__ = ["audio", "augment", "config", "features", "manifest", "metrics", "model"]
