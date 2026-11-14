@@ -21,7 +21,7 @@
 #include <protocol.h>
 
 // ---------- settings ----------
-#define TEXT_MODE   1   // 1: readable levels in Serial Monitor. 0: binary stream for recorder.py
+#define TEXT_MODE   0   // 1: readable levels in Serial Monitor. 0: binary stream for recorder.py
 #define PDM_LINES   2   // 1: mics 1-2 (D1 only). 2: all four mics (D1 + D3)
 #define GAIN_SHIFT  1   // digital gain, each step doubles. Raise (1-4) if levels stay tiny
 
