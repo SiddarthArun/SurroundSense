@@ -6,11 +6,15 @@
 * evaluates both on the test split and warns when int8 drops more than 3 points
 * writes artifacts/model.h (int8 model as a C array) and artifacts/labels.txt
 * prints the int8 input scale / zero point the firmware needs
+* optionally copies model.h into a firmware sketch folder (--firmware-dir)
+* warns when libraries/protocol/protocol.h CLASS_NAMES differ from labels.txt
 """
 
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -23,6 +27,7 @@ from yamdetector import features, manifest, metrics  # noqa: E402
 from yamdetector.config import ConfigError, label_order, load_config, set_seed  # noqa: E402
 
 ACCURACY_WARNING_POINTS = 3.0
+PROTOCOL_HEADER = PROJECT_ROOT / "libraries" / "protocol" / "protocol.h"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -41,6 +46,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=200,
         help="training windows used to calibrate int8 quantization (default: 200)",
+    )
+    parser.add_argument(
+        "--firmware-dir",
+        default=None,
+        help="also copy model.h into this sketch folder, e.g. room_capture "
+        "(artifacts/ is gitignored, the sketch folder is not)",
     )
     return parser.parse_args(argv)
 
@@ -153,6 +164,53 @@ def write_model_header(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def protocol_class_names(header: Path) -> list[str] | None:
+    """Read CLASS_NAMES from the firmware's protocol.h; None if it can't be found."""
+    if not header.exists():
+        return None
+    text = header.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"CLASS_NAMES\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", text)
+    if not match:
+        return None
+    return re.findall(r'"([^"]*)"', match.group(1))
+
+
+def check_protocol_labels(labels: list[str], header: Path = PROTOCOL_HEADER) -> bool:
+    """Warn when the firmware class list differs from the model output order."""
+    names = protocol_class_names(header)
+    if names is None:
+        print(f"note: no CLASS_NAMES found in {header}; skipped the firmware class check")
+        return True
+    if names == list(labels):
+        print(f"firmware class list matches labels.txt ({header.relative_to(PROJECT_ROOT)})")
+        return True
+    print(
+        "WARNING: the firmware's class list does not match the model output order.\n"
+        f"  labels.txt      : {', '.join(labels)}\n"
+        f"  protocol.h      : {', '.join(names)}\n"
+        f"  Update CLASS_NAMES and the CLS_ enum in {header.relative_to(PROJECT_ROOT)} "
+        "to the labels.txt order, or the wristband will name the wrong sound.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def copy_header_to_firmware(header_path: Path, firmware_dir: str) -> Path | None:
+    """Copy model.h into a sketch folder so it can be committed and #included."""
+    target_dir = Path(firmware_dir).expanduser()
+    if not target_dir.is_absolute():
+        target_dir = PROJECT_ROOT / target_dir
+    if not target_dir.is_dir():
+        print(
+            f"WARNING: --firmware-dir {target_dir} is not a folder; model.h was not copied",
+            file=sys.stderr,
+        )
+        return None
+    target = target_dir / header_path.name
+    shutil.copy2(header_path, target)
+    return target
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -280,6 +338,11 @@ def main(argv: list[str] | None = None) -> int:
     write_labels(labels_path, labels)
     print(f"\n{header_path} ({features.human_bytes(header_path.stat().st_size)})")
     print(f"{labels_path} ({len(labels)} labels, model output order)")
+    if args.firmware_dir:
+        copied = copy_header_to_firmware(header_path, args.firmware_dir)
+        if copied is not None:
+            print(f"copied model.h to {copied}")
+    check_protocol_labels(labels)
 
     print("\nint8 input quantization (needed by the firmware):")
     print(f"  input shape      : {tuple(int(dim) for dim in input_details['shape'])} (int8)")

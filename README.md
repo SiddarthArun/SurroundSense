@@ -36,7 +36,15 @@ export.py                    stage 4: float/int8 TFLite, model.h, labels.txt
 src/yamdetector/             shared library (audio, manifest, features, model, metrics)
 tests/                       unit tests for slicing and split logic
 audio/, meta/esc50.csv       the ESC-50 dataset committed to this repo (read-only)
+
+libraries/protocol/protocol.h firmware constants, radio message, class list (shared by all sketches)
+sense_hello/, esp01_hello/   board bring-up sketches (print MAC, PSRAM / supply voltage)
+room_capture/                room unit firmware: 4 PDM mics -> laptop over USB
+host/recorder.py             records the room unit's mics into my_recordings_raw/<label>/
 ```
+
+The Arduino IDE's sketchbook location must be this repo folder (File -> Preferences),
+so every sketch can `#include <protocol.h>` from `libraries/protocol/`.
 
 The ESC-50 files live in `audio/` and `meta/esc50.csv` at the repo root. A
 `data/ESC-50/audio` + `data/ESC-50/meta/esc50.csv` layout is detected too;
@@ -89,6 +97,7 @@ python train.py --no-augment --force-features         # no augmentation, recompu
 
 # 4. export for the firmware
 python export.py
+python export.py --firmware-dir room_capture   # also copy model.h into the sketch
 ```
 
 `--limit N` on stage 1 processes only the first N rows of `esc50.csv` (smoke test;
@@ -127,6 +136,27 @@ classes) and split ~70/15/15 **across files**, stable per class.
 Add new class names to `classes.order` in `config.yaml` if you want to pin their
 position in the model output; otherwise new labels follow alphabetically.
 `labels.txt` always lists the exact output order after training.
+
+### Recording through the room unit
+
+The device classifies mic 1, which `recorder.py` saves as channel 0, the channel
+`convert_recordings.py` uses by default. So recordings made this way match what the
+device hears.
+
+1. Flash `room_capture` with `TEXT_MODE 0` and close the Arduino Serial Monitor.
+2. Record each class, playing the sound from a phone at a few distances and angles:
+
+   ```bash
+   python host/recorder.py --port COM11 --label alarm --seconds 10
+   python host/recorder.py --port COM11 --label background --seconds 60
+   ```
+
+   Files land in `my_recordings_raw/<label>/` (gitignored: share them through a drive).
+   The recorder prints the dropped-block count and the strongest frequency on mic 1.
+3. `python scripts/convert_recordings.py`, then train and export as above.
+
+ESC-50's `clock_alarm` is not a smoke alarm, so record a real smoke-alarm sound into
+`my_recordings_raw/alarm/` before the demo.
 
 ## What training does
 
@@ -177,7 +207,16 @@ accuracy is more than 3 points below float.
    `int8 = clip(round(f / scale) + zero_point, -128, 127)`. These are also in
    `model.h` as `kYamInputScale` / `kYamInputZeroPoint`.
 3. Output index -> class name comes from `labels.txt` (same order as
-   `classes.order`, unknown labels appended alphabetically).
+   `classes.order`, unknown labels appended alphabetically). The room unit sends that
+   index as `class_id` over ESP-NOW, so `CLASS_NAMES` and the `CLS_` enum in
+   `libraries/protocol/protocol.h` must list the same classes in the same order.
+   `export.py` checks this and warns on a mismatch.
+4. Before the microfrontend, peak-normalize each 1 s window exactly as training does
+   (`audio.peak_target` 0.95, at most `audio.max_gain_db` +20 dB), and reset the
+   frontend's state for every window: the Python op starts each window fresh, while
+   the C frontend's noise-reduction and gain stages carry state across frames.
+5. `python export.py --firmware-dir room_capture` also copies `model.h` into the sketch
+   folder, since `artifacts/` is gitignored.
 
 ## Tests
 
