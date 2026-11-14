@@ -1,0 +1,13 @@
+# yamDetector runtime requirements (CPU training works on Windows/macOS/Linux).
+#
+# GPU training: TensorFlow has no native CUDA support on Windows. For the
+# RTX 3050, run these stages inside WSL2 (Ubuntu) or Linux and install the
+# CUDA-enabled package instead:
+#   pip install "tensorflow[and-cuda]>=2.16"
+# The code picks up the GPU automatically when present and falls back to CPU.
+tensorflow>=2.16
+numpy>=1.24
+scipy>=1.10
+soundfile>=0.12
+PyYAML>=6.0
+matplotlib>=3.7

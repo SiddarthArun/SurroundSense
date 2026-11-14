@@ -1,0 +1,9 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated data (windows, cached features, exported models)
+data/processed/
+data/features/
+artifacts/

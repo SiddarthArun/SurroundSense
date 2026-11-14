@@ -1,0 +1,109 @@
+# yamDetector - audio event classifier for an ESP32-S3 wearable (TFLite Micro)
+#
+# Every stage reads this file. Paths are relative to the project root
+# (the directory containing this file) unless they are absolute.
+
+paths:
+  # ESC-50 dataset root: a folder with audio/ and meta/esc50.csv.
+  # In this repo the clips live in audio/ and meta/esc50.csv at the repo root.
+  # The public layout (data/ESC-50/audio + data/ESC-50/meta/esc50.csv) is
+  # auto-detected too; set these explicitly if neither matches.
+  esc50_audio_dir: audio
+  esc50_meta_csv: meta/esc50.csv
+
+  # Stage 2 input: my_recordings_raw/<class>/<recording>.wav (any rate/channels)
+  raw_recordings_dir: my_recordings_raw
+
+  # The standardized dataset folder that stage 1+2 write and stage 3 reads
+  processed_dir: data/processed
+  manifest_csv: data/processed/manifest.csv
+
+  # Cached microfrontend features (one .npy per window) and run artifacts
+  feature_cache_dir: data/features
+  output_dir: artifacts
+
+audio:
+  sample_rate: 16000            # model / hardware sample rate
+  window_seconds: 1.0           # classification window fed to the microfrontend
+  hop_seconds: 1.0              # non-overlapping windows
+  peak_target: 0.95             # peak normalization target per window
+  max_gain_db: 20.0             # never boost a quiet window more than this
+
+  # Near-silent window rejection. Applied to target classes only; background
+  # windows are the noise source and are kept (only pure digital silence is dropped).
+  silence_rms: 0.005
+
+classes:
+  background: background
+
+  # ESC-50 category -> label used in data/processed/ and on the device.
+  # Anything not listed here becomes `background`.
+  esc50_map:
+    siren: siren
+    car_horn: car_horn
+    clock_alarm: alarm
+    door_wood_knock: knock
+
+  # Canonical label order (index in this list = model output index for labels
+  # that are present in the manifest). New classes from stage 2 recordings are
+  # appended in alphabetical order after these, so add them here to pin the order.
+  order:
+    - siren
+    - car_horn
+    - alarm
+    - knock
+    - background
+
+prepare:
+  esc50_source: esc50          # value written to manifest.source for ESC-50 windows
+  own_source: own              # value written to manifest.source for own recordings
+  background_ratio: 4.0        # background windows = ratio * avg target-class windows
+  overlap_seconds: 0.0         # 0 = non-overlapping windows
+
+splits:
+  # ESC-50 folds -> split. Windows inherit the fold of their source file.
+  esc50_folds:
+    train: [1, 2, 3]
+    val: [4]
+    test: [5]
+  # Own recordings: split by source file (never by window) with these ratios.
+  own_ratios:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  seed: 42                     # used for own-recording split assignment
+
+features:
+  # TensorFlow audio_microfrontend (the same frontend runs on the ESP32-S3)
+  kind: microfrontend
+  channels: 40                 # -> ~49 x 40 x 1
+  window_ms: 30
+  step_ms: 20
+  lower_band_limit_hz: 125.0
+  upper_band_limit_hz: 7500.0
+  output_scale_shift: 0.0
+  left_context: true
+  right_context: true
+  # Cached features are the op's log-scaled values divided by this number:
+  # roughly 0-2.6 with a mean near 1 (8-bit frontend dynamic range). The
+  # firmware must apply the same division before quantizing the input.
+  value_scale: 255.0
+
+training:
+  batch_size: 16               # small on purpose (6 GB laptop GPU / CPU only runs)
+  epochs: 50
+  learning_rate: 0.001
+  patience: 10                 # early stopping on val_loss
+  seed: 42
+  shuffle_buffer: 1024
+  num_parallel_loads: 2
+  max_class_weight: 10.0
+
+augment:
+  enabled: true
+  copies_per_sample: 3         # extra augmented windows generated once per train window
+  noise_snr_db: [0.0, 20.0]    # random SNR range when mixing background noise
+  noise_probability: 0.6       # fraction of copies that get noise mixed in
+  gain_db: [-6.0, 6.0]
+  shift_ms: 100.0              # random time shift within the 1 s window, +/- this
+  noise_pool_size: 192         # max background windows kept in RAM for mixing
