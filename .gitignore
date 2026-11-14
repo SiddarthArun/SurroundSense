@@ -7,4 +7,10 @@ __pycache__/
 data/processed/
 data/features/
 artifacts/
+<<<<<<< HEAD
 demo.py
+=======
+# Ignore libraries
+libraries/*
+!libraries/protocol/
+>>>>>>> 64f426ad78e28ef8e1bc001e20293aa814cc59e9
