@@ -10,9 +10,9 @@ The ESP32-S3 uses its hardware I2S peripheral in PDM receive mode (I2S_MODE_PDM_
 
 | Component / Signal | ESP32-S3 Pin | Description / Notes |
 | :--- | :--- | :--- |
-| **PDM Clock (CLK)** | GPIO 4 | Shared clock line connected to all 4 PDM mics |
-| **PDM Data 0 (DAT0)** | GPIO 5 | Data input line 0 (Mics 1 & 2 via left/right select) |
-| **PDM Data 1 (DAT1)** | GPIO 6 | Data input line 1 (Mics 3 & 4 via left/right select) |
+| **PDM Clock (CLK)** | GPIO 1 | Shared clock line connected to all 4 PDM mics |
+| **PDM Data 0 (DAT0)** | GPIO 2 | Data input line 0 (Mics 1 & 2 via left/right select) |
+| **PDM Data 1 (DAT1)** | GPIO 4 | Data input line 1 (Mics 3 & 4 via left/right select) |
 | **VCC (Power)** | 3.3V | Power supply for MEMS microphones |
 | **GND (Ground)** | GND | Common ground |
 
