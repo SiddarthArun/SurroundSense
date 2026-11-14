@@ -41,6 +41,8 @@ bool     ringFull = false;
 int      blocksSinceRun = 0;
 uint32_t lastEventMs[CLS_COUNT];
 uint32_t eventCount = 0;
+uint8_t  lastEventClass = CLS_BACKGROUND;   // latest Event, read by room_capture's radio code
+uint8_t  lastEventConf  = 0;                // 0-255, the confidence the band displays
 
 FrontendState             frontend;
 tflite::MicroInterpreter *interpreter = nullptr;
@@ -198,6 +200,8 @@ bool inferRun() {
       (lastEventMs[best] == 0 || now - lastEventMs[best] >= COOLDOWN_MS)) {
     lastEventMs[best] = now;
     eventCount++;
+    lastEventClass = (uint8_t)best;
+    lastEventConf  = (uint8_t)lroundf(prob[best] * 255.0f);
     char name[24];
     size_t i = 0;
     for (; CLASS_NAMES[best][i] && i < sizeof(name) - 1; i++) name[i] = toupper(CLASS_NAMES[best][i]);

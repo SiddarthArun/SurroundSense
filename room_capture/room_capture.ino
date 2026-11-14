@@ -14,7 +14,8 @@
 //   4. Still dropping blocks? STREAM_CHANNELS 1 sends mic 1 only (recorder.py --channels 1).
 //   5. MODE_INFER. Train, then `python export.py --firmware-dir room_capture` (writes model.h
 //      here). Upload, open Serial Monitor: probabilities every 0.5 s, Event lines on a
-//      detection. Settings at the top of yam_infer.h.
+//      detection, and each Event broadcast over ESP-NOW to the wristband (wristband/).
+//      Settings at the top of yam_infer.h.
 //
 // Wiring (all mics: 3V -> 3V3, GND -> GND):
 //   Mic 1: CLK D0, DAT D1, SEL GND     Mic 2: CLK D0, DAT D1, SEL 3V3
@@ -55,6 +56,9 @@ const uint8_t SLOT_FOR_MIC[CH] = {1, 0};
 constexpr size_t PAYLOAD_BYTES = FRAMES * STREAM_CHANNELS * sizeof(int16_t);
 
 #if MODE == MODE_INFER
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_now.h>
 #include "yam_infer.h"   // classifier; needs model.h from export.py --firmware-dir room_capture
 #endif
 
@@ -115,6 +119,73 @@ bool startMics() {
   return true;
 }
 
+// ---------- radio: ESP-NOW alerts to the wristband (MODE_INFER only) ----------
+#if MODE == MODE_INFER
+#define HEARTBEAT_MS 5000
+
+// Broadcast on purpose: the band learns this board's MAC from each message and sends its ACK
+// straight back, so there is no MAC to paste. Put the band's MAC here (bringup/esp01_hello)
+// to send unicast instead; the band answers either way.
+static const uint8_t WRIST_ADDR[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+uint16_t radioSeq = 0;
+uint32_t sentEvents = 0;
+uint32_t lastHeartbeat = 0;
+volatile bool     ackPending = false;
+volatile uint16_t ackSeq = 0;
+volatile uint32_t ackRttMs = 0;
+
+// The band echoes seq and t_ms, so the RTT is millis() minus its echo: one clock, no sync.
+void onRadioRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != (int)sizeof(msg_t)) return;
+  msg_t m;
+  memcpy(&m, data, sizeof(m));
+  if (m.type != MSG_ACK) return;
+  ackSeq = m.seq;
+  ackRttMs = millis() - m.t_ms;
+  ackPending = true;
+}
+
+bool radioSetup() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != ESP_OK) return false;
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_now_register_recv_cb(onRadioRecv);   // the ACK is the delivery report
+  Serial.printf("[yamDetector] radio: ESP-NOW channel %d, alerts broadcast\n", ESPNOW_CHANNEL);
+  return true;
+}
+
+void radioSend(uint8_t type, uint8_t cls, uint8_t conf) {
+  msg_t m = {};
+  m.type     = type;
+  m.class_id = cls;
+  m.conf     = conf;
+  m.zone     = 0;   // direction estimation is not built yet
+  m.seq      = ++radioSeq;
+  m.t_ms     = millis();
+  esp_now_send(WRIST_ADDR, (const uint8_t *)&m, sizeof(m));
+}
+
+// Runs after every audio block: forwards a new Event, keeps the link alive, reports ACKs.
+void radioLoop() {
+  if (eventCount != sentEvents) {
+    sentEvents = eventCount;
+    radioSend(MSG_ALERT, lastEventClass, lastEventConf);
+  }
+  const uint32_t now = millis();
+  if (now - lastHeartbeat >= HEARTBEAT_MS) {
+    lastHeartbeat = now;
+    radioSend(MSG_HEARTBEAT, CLS_BACKGROUND, 0);
+  }
+  if (ackPending) {
+    ackPending = false;
+    Serial.printf("[yamDetector] wristband ACK seq %u, %lu ms\n",
+                  (unsigned)ackSeq, (unsigned long)ackRttMs);
+  }
+}
+#endif
+
 void setup() {
   Serial.setTxBufferSize(8192);   // room for a few blocks
   Serial.setTxTimeoutMs(50);      // ride out short USB stalls; the 240 ms DMA buffer covers the wait
@@ -124,6 +195,10 @@ void setup() {
   const uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 3000) delay(10);   // give the Serial Monitor a moment
   inferSetup();
+  // One MSG_TEST at boot: the band shows it as TEST and buzzes, which checks the radio path
+  // without waiting for a real siren.
+  if (radioSetup()) radioSend(MSG_TEST, CLS_SIREN, 0);
+  else Serial.println("[yamDetector] radio: ESP-NOW init failed, alerts will not be sent");
 #endif
   if (!startMics()) fail();
 }
@@ -223,6 +298,7 @@ void loop() {
   processBlock();
 #if MODE == MODE_INFER
   inferPushBlock(block, FRAMES, CH);
+  radioLoop();
 #elif MODE == MODE_LEVELS
   textReport();
 #else

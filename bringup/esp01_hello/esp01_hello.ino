@@ -4,7 +4,8 @@
 // Tools menu: Board "Generic ESP8266 Module" | Upload Speed 115200
 //             Reset Method "no dtr (aka ck)" | Flash Size "1MB" (Flash Mode DOUT if uploads fail)
 // Port: the DevKit V1's COM port, with the V1's EN jumpered to GND.
-// Upload: GPIO0 to GND, tap RST, Upload. Then free GPIO0, tap RST, Serial Monitor at 115200.
+// Upload: no reset button on the band, so GPIO0 to GND *before* power arrives, then Upload.
+//         Free GPIO0, power-cycle again, Serial Monitor at 115200.
 
 #include <ESP8266WiFi.h>
 #include <protocol.h>

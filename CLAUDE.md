@@ -16,7 +16,8 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
   inference (`yam_infer.h`, needs `model.h` from `export.py --firmware-dir room_capture`).
 - `bringup/sense_hello/`, `bringup/esp01_hello/`: bring-up sketches (MAC, PSRAM / Vcc, msg_t size).
 - `host/recorder.py`: records the room unit's `MODE_STREAM` output into `my_recordings_raw/<label>/`.
-- Not built yet: wristband firmware (ESP-NOW receive, motor, OLED), direction estimation.
+- `wristband/`: ESP-01 receiver (ESP-NOW in, motor on GPIO3, SSD1306 on GPIO0/GPIO2, ACK back).
+- Not built yet: direction estimation.
 
 ## Hardware facts
 - Sense PDM pins: CLK D0 (GPIO1), DATA0 D1 (GPIO2, mics 1-2), DATA1 D3 (GPIO4, mics 3-4).
@@ -26,8 +27,11 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
 - Audio: 16 kHz, int16, 4 channels interleaved. The classifier uses mic 1 (channel 0).
 - Serial frame (room unit -> laptop, native USB): `A5 5A`, type, seq u16 LE, len u16 LE, payload.
 - ESP-01: 3.3 V only (2xAA alkaline, no regulator). Motor on GPIO3 via NPN, OLED I2C SDA GPIO0,
-  SCL GPIO2. Flashed through the ESP32 DevKit V1 (V1 EN tied to GND, TX->TX, RX->RX,
-  ESP-01 GPIO0 low while flashing).
+  SCL GPIO2 (the OLED's pull-ups are what keep both boot straps high). GPIO3 is UART RX, so the
+  band prints on GPIO1 only. Flashed through the ESP32 DevKit V1 (V1 EN tied to GND, TX->TX,
+  RX->RX, ESP-01 GPIO0 low while power arrives). The assembled band has no buttons or header,
+  so flash mode is GPIO0 low at power-up and restarting means pulling a cell: firmware must
+  never need a reset (retry radio/OLED startup in loop, no blocking waits in setup).
 - ESP-NOW channel 1 (`ESPNOW_CHANNEL`). Planned: the wristband ACKs alerts, echoing `seq` and `t_ms`.
 
 ## Rules
@@ -44,3 +48,5 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
 - Firmware compile (arduino-cli ships inside the Arduino IDE at
   `C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`):
   `arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3:CDCOnBoot=default,PSRAM=opi --libraries libraries room_capture`
+- Wristband compile (esp8266 core 3.1.x, needs Adafruit SSD1306 + GFX installed):
+  `arduino-cli compile --fqbn esp8266:esp8266:generic:eesz=1M --libraries libraries wristband`
