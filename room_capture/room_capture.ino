@@ -63,7 +63,7 @@ constexpr size_t PAYLOAD_BYTES = FRAMES * STREAM_CHANNELS * sizeof(int16_t);
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
-#include "yam_infer.h"   // classifier; needs model.h from export.py --firmware-dir room_capture
+#include "yam_infer.h"   // classifier; MODEL_CLASSES and ALERT_ON at its top
 #endif
 
 i2s_chan_handle_t rxChan = nullptr;

@@ -83,8 +83,8 @@ classes:
   # Canonical label order (index in this list = model output index for labels
   # that are present in the manifest). New classes from stage 2 recordings are
   # appended in alphabetical order after these, so add them here to pin the order.
-  # Keep libraries/protocol/protocol.h CLASS_NAMES in this exact order: the device
-  # sends the model output index as the class id (export.py warns on a mismatch).
+  # Every label must also be in libraries/protocol/protocol.h CLASS_NAMES: the harness
+  # matches model outputs to those class ids by name (export.py warns if one is missing).
   order:
     - siren
     - car_horn

@@ -19,8 +19,12 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
   Sketches use `#include <protocol.h>`; the Arduino sketchbook location is the repo root.
 - `libraries/microfrontend/`: TensorFlow audio microfrontend C code (vendored; uses the core's kissfft).
 - `room_capture/`: harness firmware, the working one. `MODE` picks levels / stream / on-device
-  inference (`yam_infer.h`, needs `model.h` from `export.py --firmware-dir room_capture`) plus
-  direction (`doa.h`, runs on the same 1 s window from all four mics).
+  inference (`yam_infer.h`) plus direction (`doa.h`, runs on the same 1 s window from all four
+  mics). `MODEL_CLASSES` in `yam_infer.h` picks the model: 5 = `model_5class.h` (original ESC-50
+  model, the default: it is the one that detects reliably on the harness), 13 = `model.h`
+  (FSD50K retrain, written by `export.py --firmware-dir room_capture`). Thresholds are per class
+  and per model (`CLASS_THRESHOLD`). `ALERT_ON` limits which classes fire at all: siren and knock
+  for the demo, for either model.
 - `bringup/sense_hello/`, `bringup/esp01_hello/`: bring-up sketches (MAC, PSRAM / Vcc, msg_t size).
 - `host/recorder.py`: records the harness's `MODE_STREAM` output into `my_recordings_raw/<label>/`.
 - `wristband/`: ESP-01 receiver (ESP-NOW in, motor on GPIO3, SSD1306 on GPIO0/GPIO2, ACK back).
@@ -52,9 +56,12 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
   `t_ms`. `msg_t.dir` carries `DIR_*` from `protocol.h` (0 = unknown).
 
 ## Rules
-- Class IDs = model output order = `config.yaml` `classes.order` = `protocol.h` `CLASS_NAMES`,
-  and `config.yaml` `classes.alert` = `protocol.h` `CLASS_ALERT`. Change all of them together;
-  `export.py` warns on a mismatch and `yam_infer.h` static_asserts the class count.
+- Class IDs on the radio = `protocol.h` `CLS_*` / `CLASS_NAMES`, and they never get renumbered
+  (append new classes after background). A model header lists its output names (`kYamLabels`,
+  written by `export.py`) and `yam_infer.h` maps them to those ids by name, so models with fewer
+  classes or another order need no wristband reflash. Every model class must exist in
+  `CLASS_NAMES`, and `config.yaml` `classes.alert` = `protocol.h` `CLASS_ALERT`; `export.py`
+  warns on both.
 - On-device features must match training: DC block, per-window peak normalize
   (0.95, max +20 dB), microfrontend with identical parameters and fresh state per 1 s
   window, divide by 255, quantize with `kYamInputScale` / `kYamInputZeroPoint` from `model.h`.

@@ -10,7 +10,7 @@
   time-shift augmentation, and streamed from disk in small batches
 * reports per-class precision/recall/F1, a confusion matrix PNG, macro F1, the
   background false-positive rate, the false alerts per hour that implies, and
-  what each candidate DETECT_THRESHOLD would do on the test split
+  what each candidate CLASS_THRESHOLD value would do on the test split
 """
 
 from __future__ import annotations
@@ -220,7 +220,7 @@ def threshold_report(
     alert_indices: set[int],
     windows_per_hour: float,
 ) -> None:
-    """What each DETECT_THRESHOLD would cost on the test split.
+    """What each CLASS_THRESHOLD value would cost on the test split.
 
     The device fires when argmax is an alert class and its probability reaches
     the threshold, so both numbers below use exactly that rule. A false alert
@@ -234,7 +234,7 @@ def threshold_report(
     print("\nthreshold sweep on the test split (device rule: argmax is an alert class and p >= t):")
     print(f"  {'t':>5}{'false alerts/h':>17}{'alert recall':>14}")
     for threshold in THRESHOLDS:
-        fired = (predicted != background_index) & (confidence >= threshold)
+        fired = np.isin(predicted, sorted(alert_indices)) & (confidence >= threshold)
         false_rate = (
             float(fired[background_mask].mean()) * windows_per_hour
             if background_mask.any()

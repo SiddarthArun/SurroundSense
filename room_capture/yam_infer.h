@@ -1,6 +1,6 @@
 // yam_infer.h: on-device classifier for room_capture (MODE_INFER only).
-// Included once, from room_capture.ino. Needs model.h in this folder:
-//   python export.py --firmware-dir room_capture
+// Included once, from room_capture.ino. MODEL_CLASSES below picks the model header;
+// `python export.py --firmware-dir room_capture` writes a new model.h.
 //
 // Every 0.5 s it takes the last 1 s of mic 1 and runs the same steps as training:
 //   peak normalize (0.95, max +20 dB)    -> src/yamdetector/audio.py peak_normalize
@@ -16,12 +16,59 @@
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "model.h"
 
 // ---------- settings ----------
-#define DETECT_THRESHOLD 0.70f   // min probability for an Event line
+// Which model runs. Both take the same 49 x 40 features and both report classes by their
+// protocol.h id, so the wristband needs no reflash when this changes.
+//    5: model_5class.h, the original ESC-50 model: siren, car_horn, alarm, knock (+ background)
+//   13: model.h, the FSD50K + RAVDESS retrain (the file export.py writes)
+#ifndef MODEL_CLASSES
+#define MODEL_CLASSES    5
+#endif
 #define COOLDOWN_MS      1500    // per class: no repeat Event lines within this time
-#define PRINT_PROBS      1       // 1: one line per window with every class probability
+#define PRINT_PROBS      1       // 1: one line per window with every class the model has
+
+// The only classes that make an Event, and so the only ones that buzz and show on the band.
+// Every other class still prints its probability but never fires. Applies to either model; to
+// bring one back, add its CLS_* name (protocol.h) here.
+const uint8_t ALERT_ON[] = {CLS_SIREN, CLS_KNOCK, CLS_ALARM};
+
+#if MODEL_CLASSES == 5
+#include "model_5class.h"
+#else
+#include "model.h"
+#endif
+
+// Min probability for an Event, one per class in CLS_* order (protocol.h). Tune on the harness.
+#if MODEL_CLASSES == 5
+// The original model is confident (clear sounds score 0.9+), so one bar fits its four classes.
+const float CLASS_THRESHOLD[] = {
+    0.70f, 0.70f, 0.70f, 0.70f,                 // siren, car_horn, alarm, knock
+    1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,   // glass .. thunder: not in this model
+    1.00f, 1.00f, 1.00f,                        // speech, music, background: never fire
+};
+#else
+// This model is trained with label smoothing, so even clear alarms and sirens peak around 0.7
+// and need a low bar, while thunder and dog_bark also fire on rumble and noise and need a high
+// one. Picked from ESC-50 fold 5 (8 clips per class, 336 background clips).
+const float CLASS_THRESHOLD[] = {
+    0.40f,  // siren
+    0.40f,  // car_horn
+    0.40f,  // alarm
+    0.70f,  // knock
+    0.60f,  // glass
+    0.60f,  // scream     (not in ESC-50: set from its false alerts only)
+    0.50f,  // baby_cry
+    0.80f,  // dog_bark
+    0.60f,  // gunshot    (not in ESC-50: set from its false alerts only)
+    0.80f,  // thunder
+    1.00f,  // speech      silent tier (CLASS_ALERT false): these three never fire,
+    1.00f,  // music       so their values are unused
+    1.00f,  // background
+};
+#endif
+static_assert(sizeof(CLASS_THRESHOLD) / sizeof(CLASS_THRESHOLD[0]) == CLS_COUNT,
+              "CLASS_THRESHOLD needs one entry per class in protocol.h");
 
 constexpr int    WIN_SAMPLES = AUDIO_SAMPLE_RATE;   // 1 s window (audio.window_seconds)
 constexpr int    HOP_BLOCKS  = 31;                  // 31 x 16 ms = ~0.5 s between windows
@@ -32,10 +79,23 @@ constexpr float kPeakTarget = 0.95f;    // audio.peak_target
 constexpr float kMaxGain    = 10.0f;    // audio.max_gain_db = 20 dB
 constexpr float kValueScale = 255.0f;   // features.value_scale
 
-static_assert(kYamOutputClasses == CLS_COUNT,
-              "model.h and protocol.h list a different number of classes: re-export, or update CLASS_NAMES");
+static_assert(kYamOutputClasses <= CLS_COUNT,
+              "the model has more classes than protocol.h: add them to CLASS_NAMES, CLS_* and CLASS_ALERT");
 
 #include "doa.h"   // direction; uses WIN_SAMPLES
+
+// Model output index -> protocol.h class id (CLS_*), filled by name in inferSetup. The radio and
+// the wristband only ever see protocol ids, so a model may have fewer classes or another order.
+uint8_t modelClass[kYamOutputClasses];
+
+// An alert-tier class (CLASS_ALERT) that is also listed in ALERT_ON.
+bool alertOn(int c) {
+  if (!CLASS_ALERT[c]) return false;
+  for (uint8_t on : ALERT_ON) {
+    if (on == c) return true;
+  }
+  return false;
+}
 
 int16_t *ring = nullptr;      // last 1 s of every mic, CH channels interleaved (PSRAM)
 int16_t  win[WIN_SAMPLES];    // window being classified: mic 1, oldest sample first
@@ -120,16 +180,34 @@ void inferSetup() {
   if (inputT->type != kTfLiteInt8 || inputT->bytes != (size_t)(kYamInputFrames * kYamInputChannels)) {
     inferFail("model input is not int8 49x40: re-export with export.py");
   }
-  if (outputT->type != kTfLiteInt8 || outputT->dims->data[outputT->dims->size - 1] != CLS_COUNT) {
-    inferFail("model output is not int8 with CLS_COUNT classes");
+  if (outputT->type != kTfLiteInt8 || outputT->dims->data[outputT->dims->size - 1] != kYamOutputClasses) {
+    inferFail("model output is not int8 with kYamOutputClasses classes");
+  }
+  for (int i = 0; i < kYamOutputClasses; i++) {
+    int id = -1;
+    for (int c = 0; c < CLS_COUNT; c++) {
+      if (strcmp(kYamLabels[i], CLASS_NAMES[c]) == 0) id = c;
+    }
+    if (id < 0) inferFail("the model header names a class that CLASS_NAMES in protocol.h doesn't list");
+    modelClass[i] = (uint8_t)id;
   }
 
   ring = (int16_t *)heap_caps_malloc(WIN_SAMPLES * CH * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!ring) inferFail("no memory for the audio ring: is Tools > PSRAM set to OPI PSRAM?");
 
-  Serial.printf("[yamDetector] ready: model %u B, arena used %u of %u B (%s), threshold %.2f\n",
-                g_yam_model_tflite_len, (unsigned)interpreter->arena_used_bytes(),
-                (unsigned)ARENA_BYTES, where, DETECT_THRESHOLD);
+  Serial.printf("[yamDetector] ready: model %u B, %d classes, arena used %u of %u B (%s)\n",
+                g_yam_model_tflite_len, kYamOutputClasses, (unsigned)interpreter->arena_used_bytes(),
+                (unsigned)ARENA_BYTES, where);
+  Serial.print("[yamDetector] alerts on:");
+  int alerts = 0;
+  for (int i = 0; i < kYamOutputClasses; i++) {
+    const int c = modelClass[i];
+    if (alertOn(c)) {
+      Serial.printf(" %s %.2f", CLASS_NAMES[c], CLASS_THRESHOLD[c]);
+      alerts++;
+    }
+  }
+  Serial.println(alerts ? "" : " none (ALERT_ON lists no class this model has)");
   if (doaSetup()) Serial.printf("[yamDetector] direction: on, %d directions\n", DOA_SECTORS);
   else            Serial.println("[yamDetector] direction: off (needs all 4 mics, PDM_LINES 2)");
 }
@@ -199,22 +277,24 @@ bool inferRun() {
     return false;
   }
 
-  float prob[CLS_COUNT];
-  int best = 0;
-  for (int c = 0; c < CLS_COUNT; c++) {
-    prob[c] = (outputT->data.int8[c] - outputT->params.zero_point) * outputT->params.scale;
+  // Probabilities by protocol.h class id; classes this model doesn't have stay at 0.
+  float prob[CLS_COUNT] = {};
+  int best = modelClass[0];
+  for (int i = 0; i < kYamOutputClasses; i++) {
+    const int c = modelClass[i];
+    prob[c] = (outputT->data.int8[i] - outputT->params.zero_point) * outputT->params.scale;
     if (prob[c] > prob[best]) best = c;
   }
   const uint32_t now = millis();
 
 #if PRINT_PROBS
-  for (int c = 0; c < CLS_COUNT; c++) Serial.printf("%s %.2f  ", CLASS_NAMES[c], prob[c]);
+  for (int i = 0; i < kYamOutputClasses; i++) Serial.printf("%s %.2f  ", kYamLabels[i], prob[modelClass[i]]);
   Serial.printf("| gain %4.1f | %lu ms\n", gain, (unsigned long)(now - t0));
 #endif
 
-  // CLASS_ALERT comes from protocol.h (classes.alert in config.yaml): speech, music
-  // and background classify fine but never buzz the band.
-  const bool isEvent = CLASS_ALERT[best] && prob[best] >= DETECT_THRESHOLD &&
+  // Only ALERT_ON classes fire (and never the silent tier: speech, music, background). When the
+  // top class is one that's off, nothing fires, even if siren or knock is second.
+  const bool isEvent = alertOn(best) && prob[best] >= CLASS_THRESHOLD[best] &&
                        (lastEventMs[best] == 0 || now - lastEventMs[best] >= COOLDOWN_MS);
 
   // Direction from all four mics over this same window (ring still holds exactly it).

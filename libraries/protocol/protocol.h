@@ -22,10 +22,11 @@
 // Radio message types
 enum : uint8_t { MSG_ALERT = 1, MSG_HEARTBEAT = 2, MSG_ACK = 3, MSG_TEST = 4 };
 
-// Sound classes. MUST match classes.order in config.yaml (= artifacts/labels.txt):
-// the room unit sends the model's output index as class_id, and the wristband looks
-// the name up here. When a class is added to config.yaml, add it here in the same
-// position too; export.py warns if CLASS_NAMES or CLASS_ALERT differ.
+// Sound classes: the ids on the radio. The harness matches its model's output names
+// (kYamLabels in the model header) to CLASS_NAMES and sends these ids, so a model may
+// have fewer classes or another order and the wristband still names the sound right.
+// Never renumber: append new classes after background (13-15), so a wristband flashed
+// earlier keeps working. export.py warns if a model class or its CLASS_ALERT tier is off.
 enum : uint8_t {
   CLS_SIREN        = 0,
   CLS_CAR_HORN     = 1,

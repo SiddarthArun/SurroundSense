@@ -11,6 +11,8 @@ constexpr int kYamInputChannels = 40;
 constexpr float kYamInputScale = 0.01030372921f;
 constexpr int32_t kYamInputZeroPoint = -128;
 constexpr int kYamOutputClasses = 13;
+// Output order. yam_infer.h matches these names to CLASS_NAMES in protocol.h.
+static const char *const kYamLabels[kYamOutputClasses] = {"siren", "car_horn", "alarm", "knock", "glass", "scream", "baby_cry", "dog_bark", "gunshot", "thunder", "speech", "music", "background"};
 
 alignas(8) const unsigned char g_yam_model_tflite[] = {
     0x1c, 0x00, 0x00, 0x00, 0x54, 0x46, 0x4c, 0x33, 0x14, 0x00, 0x20, 0x00,

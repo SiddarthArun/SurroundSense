@@ -7,8 +7,8 @@
 * writes artifacts/model.h (int8 model as a C array) and artifacts/labels.txt
 * prints the int8 input scale / zero point the firmware needs
 * optionally copies model.h into a firmware sketch folder (--firmware-dir)
-* warns when libraries/protocol/protocol.h CLASS_NAMES / CLASS_ALERT differ from
-  labels.txt and classes.alert
+* warns when a model class is missing from libraries/protocol/protocol.h
+  CLASS_NAMES, or CLASS_ALERT differs from classes.alert
 """
 
 from __future__ import annotations
@@ -147,6 +147,10 @@ def write_model_header(
         f"constexpr float kYamInputScale = {input_scale:.10g}f;",
         f"constexpr int32_t kYamInputZeroPoint = {input_zero_point};",
         f"constexpr int kYamOutputClasses = {len(labels)};",
+        "// Output order. yam_infer.h matches these names to CLASS_NAMES in protocol.h.",
+        "static const char *const kYamLabels[kYamOutputClasses] = {"
+        + ", ".join(f'"{label}"' for label in labels)
+        + "};",
         "",
         "alignas(8) const unsigned char g_yam_model_tflite[] = {",
     ]
@@ -194,21 +198,24 @@ def check_protocol_tiers(
 ) -> bool:
     """Warn when the firmware's alert tiers differ from ``classes.alert``."""
     flags = protocol_alert_flags(header)
-    if flags is None:
+    names = protocol_class_names(header)
+    if flags is None or names is None:
         print(f"note: no CLASS_ALERT found in {header}; skipped the alert tier check")
         return True
-    if len(flags) != len(labels):
+    if len(flags) != len(names):
         print(
             f"WARNING: {header.relative_to(PROJECT_ROOT)} CLASS_ALERT has {len(flags)} entries "
-            f"but the model has {len(labels)} classes",
+            f"but CLASS_NAMES has {len(names)}",
             file=sys.stderr,
         )
         return False
-    expected = [label in alert_labels for label in labels]
-    if flags == expected:
+    tier = dict(zip(names, flags))
+    mismatched = [
+        label for label in labels if label in tier and tier[label] != (label in alert_labels)
+    ]
+    if not mismatched:
         print(f"firmware alert tiers match classes.alert ({header.relative_to(PROJECT_ROOT)})")
         return True
-    mismatched = [label for label, got, want in zip(labels, flags, expected) if got != want]
     print(
         "WARNING: protocol.h CLASS_ALERT disagrees with classes.alert for: "
         + ", ".join(mismatched),
@@ -218,20 +225,26 @@ def check_protocol_tiers(
 
 
 def check_protocol_labels(labels: list[str], header: Path = PROTOCOL_HEADER) -> bool:
-    """Warn when the firmware class list differs from the model output order."""
+    """Warn when the model has a class the firmware's protocol.h does not list.
+
+    yam_infer.h matches the model's output names (kYamLabels in model.h) to
+    CLASS_NAMES, so the order may differ and a model may have fewer classes,
+    but every label has to exist there.
+    """
     names = protocol_class_names(header)
     if names is None:
         print(f"note: no CLASS_NAMES found in {header}; skipped the firmware class check")
         return True
-    if names == list(labels):
-        print(f"firmware class list matches labels.txt ({header.relative_to(PROJECT_ROOT)})")
+    missing = [label for label in labels if label not in names]
+    if not missing:
+        print(f"every model class is in the firmware class list ({header.relative_to(PROJECT_ROOT)})")
         return True
     print(
-        "WARNING: the firmware's class list does not match the model output order.\n"
-        f"  labels.txt      : {', '.join(labels)}\n"
+        "WARNING: the firmware's class list has no entry for: " + ", ".join(missing) + "\n"
         f"  protocol.h      : {', '.join(names)}\n"
-        f"  Update CLASS_NAMES and the CLS_ enum in {header.relative_to(PROJECT_ROOT)} "
-        "to the labels.txt order, or the wristband will name the wrong sound.",
+        f"  Append them to CLASS_NAMES, the CLS_ enum and CLASS_ALERT in "
+        f"{header.relative_to(PROJECT_ROOT)} (appending keeps the ids the wristband already "
+        "knows), then reflash both boards. The harness refuses to start until then.",
         file=sys.stderr,
     )
     return False
