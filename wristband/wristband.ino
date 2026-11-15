@@ -42,6 +42,7 @@
 #define OLED_ADDR       0x3C // 0x3D on some modules
 #define OLED_W          128
 #define OLED_H          64
+#define STATUS_MS       5000 // serial "alive" line, so a late-opened monitor sees the band; 0 = off
 
 ADC_MODE(ADC_VCC);   // lets ESP.getVcc() read the supply; the ESP-01 has no ADC pin
 
@@ -54,7 +55,7 @@ msg_t   inbox;
 uint8_t inboxMac[6];
 bool    inboxReady = false;
 
-msg_t    lastMsg;              // last message of any type
+msg_t    lastAlert;            // last alert or test (heartbeats must not overwrite what's shown)
 bool     haveAlert = false;
 uint32_t rxCount = 0;
 uint32_t alertCount = 0;
@@ -62,6 +63,7 @@ uint32_t lastRxMs = 0;         // millis() of the last message
 uint32_t lastAlertMs = 0;
 uint32_t motorUntil = 0;
 uint32_t lastRender = 0;
+uint32_t lastStatus = 0;
 bool     dirty = true;
 
 // ---------- radio ----------
@@ -102,7 +104,7 @@ void sendAck(const uint8_t *mac, const msg_t *m) {
   ack.type     = MSG_ACK;
   ack.class_id = m->class_id;
   ack.conf     = m->conf;
-  ack.zone     = m->zone;
+  ack.dir      = m->dir;
   ack.seq      = m->seq;
   ack.t_ms     = m->t_ms;   // the room unit subtracts this from its own clock
   esp_now_send((u8 *)mac, (u8 *)&ack, sizeof(ack));
@@ -119,6 +121,14 @@ const char *nameFor(uint8_t id) {
   if (id >= 16) return "unknown";
   snprintf(custom, sizeof(custom), "custom %u", (unsigned)id);
   return custom;
+}
+
+const char *dirName(uint8_t dir) {
+  return dir < DIR_COUNT ? DIR_NAMES[dir] : DIR_NAMES[DIR_UNKNOWN];
+}
+
+bool dirKnown(uint8_t dir) {
+  return dir != DIR_UNKNOWN && dir < DIR_COUNT;
 }
 
 // OLED only shows ASCII; CLASS_NAMES uses underscores, the screen reads better with spaces.
@@ -140,30 +150,34 @@ bool alertActive() {
 }
 
 void drawIdle() {
-  char buf[28], name[12];
+  char buf[28], name[12], dir[12];
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
-  display.print("yamDetector");
-  display.setCursor(0, 10);
-  display.print("wristband / listening");
+  display.print("yamDetector / listening");
 
   const uint32_t age = millis() - lastRxMs;
   if (rxCount == 0)                    snprintf(buf, sizeof(buf), "no signal yet");
   else if (age >= LINK_TIMEOUT_MS)     snprintf(buf, sizeof(buf), "NO SIGNAL %.1fs", age / 1000.0f);
   else                                 snprintf(buf, sizeof(buf), "link %.1fs ago", age / 1000.0f);
-  display.setCursor(0, 24);
+  display.setCursor(0, 12);
   display.print(buf);
 
   snprintf(buf, sizeof(buf), "rx %lu  alerts %lu", (unsigned long)rxCount, (unsigned long)alertCount);
-  display.setCursor(0, 34);
+  display.setCursor(0, 22);
   display.print(buf);
 
   if (haveAlert) {
-    upper(name, nameFor(lastMsg.class_id), sizeof(name));
-    snprintf(buf, sizeof(buf), "last %s %u%%", name, (unsigned)confPct(lastMsg.conf));
-    display.setCursor(0, 44);
+    upper(name, nameFor(lastAlert.class_id), sizeof(name));
+    snprintf(buf, sizeof(buf), "last %s %u%%", name, (unsigned)confPct(lastAlert.conf));
+    display.setCursor(0, 32);
     display.print(buf);
+    if (dirKnown(lastAlert.dir)) {
+      upper(dir, dirName(lastAlert.dir), sizeof(dir));
+      snprintf(buf, sizeof(buf), "from %s", dir);
+      display.setCursor(0, 42);
+      display.print(buf);
+    }
   }
 
   const uint16_t mv = ESP.getVcc();
@@ -172,31 +186,43 @@ void drawIdle() {
   display.print(buf);
 }
 
+// What it is and where it came from, both large; then confidence and details.
+//   y  0  SIREN        (size 2)
+//   y 18  BEHIND-L     (size 2, or "direction unknown")
+//   y 37  confidence bar
+//   y 47  91%  alert  0.4 s
+//   y 56  3.10 V  seq 42
 void drawAlert() {
-  char buf[28], name[12];
-  upper(name, nameFor(lastMsg.class_id), sizeof(name));
+  char buf[28], name[12], dir[12];
+  upper(name, nameFor(lastAlert.class_id), sizeof(name));
 
-  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
   display.setCursor(centerX(name, 2), 0);
   display.print(name);
 
-  const int16_t w = (int16_t)((uint16_t)lastMsg.conf * (OLED_W - 2) / 255u);
-  display.drawRect(0, 19, OLED_W, 9, SSD1306_WHITE);
-  if (w > 0) display.fillRect(1, 20, w, 7, SSD1306_WHITE);
+  if (dirKnown(lastAlert.dir)) {
+    upper(dir, dirName(lastAlert.dir), sizeof(dir));
+    display.setCursor(centerX(dir, 2), 18);
+    display.print(dir);
+  } else {
+    display.setTextSize(1);
+    display.setCursor(centerX("direction unknown", 1), 22);
+    display.print("direction unknown");
+  }
+
+  const int16_t w = (int16_t)((uint16_t)lastAlert.conf * (OLED_W - 2) / 255u);
+  display.drawRect(0, 37, OLED_W, 8, SSD1306_WHITE);
+  if (w > 0) display.fillRect(1, 38, w, 6, SSD1306_WHITE);
 
   display.setTextSize(1);
-  snprintf(buf, sizeof(buf), "%u%%  seq %u", (unsigned)confPct(lastMsg.conf), (unsigned)lastMsg.seq);
-  display.setCursor(0, 32);
+  snprintf(buf, sizeof(buf), "%u%%  %s  %.1f s", (unsigned)confPct(lastAlert.conf),
+           lastAlert.type == MSG_TEST ? "TEST" : "alert", (millis() - lastAlertMs) / 1000.0f);
+  display.setCursor(0, 47);
   display.print(buf);
 
-  snprintf(buf, sizeof(buf), "%s  %.1f s", lastMsg.type == MSG_TEST ? "TEST" : "alert",
-           (millis() - lastAlertMs) / 1000.0f);
-  display.setCursor(0, 42);
-  display.print(buf);
-
-  snprintf(buf, sizeof(buf), "%.2f V", ESP.getVcc() / 1000.0f);
-  display.setCursor(0, 54);
+  snprintf(buf, sizeof(buf), "%.2f V  seq %u", ESP.getVcc() / 1000.0f, (unsigned)lastAlert.seq);
+  display.setCursor(0, 56);
   display.print(buf);
 }
 
@@ -210,15 +236,15 @@ void handleMsg() {
 
   rxCount++;
   lastRxMs = millis();
-  lastMsg = m;
   dirty = true;
 
-  Serial.printf("[wristband] %s class %u (%s) conf %u%% seq %u\n",
+  Serial.printf("[wristband] %s class %u (%s) conf %u%% dir %s seq %u\n",
                 m.type == MSG_ALERT ? "alert" : m.type == MSG_TEST ? "test" : "heartbeat",
                 (unsigned)m.class_id, nameFor(m.class_id), (unsigned)confPct(m.conf),
-                (unsigned)m.seq);
+                dirName(m.dir), (unsigned)m.seq);
 
   if (m.type == MSG_ALERT || m.type == MSG_TEST) {
+    lastAlert = m;
     alertCount++;
     lastAlertMs = millis();
     haveAlert = true;
@@ -292,6 +318,20 @@ void loop() {
     lastDisplayTry = now;
     displayUp();
   }
+
+#if STATUS_MS
+  // The boot line goes out before a replugged Serial Monitor reconnects, and nothing else prints
+  // until a message arrives. This line makes "silent" mean "not running", not "nothing heard".
+  if (now - lastStatus >= STATUS_MS) {
+    lastStatus = now;
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    Serial.printf("[wristband] alive %lus | radio %s | ch %d | rx %lu | %u mV | MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  (unsigned long)(now / 1000), radioOk ? "ok" : "DOWN", ESPNOW_CHANNEL,
+                  (unsigned long)rxCount, (unsigned)ESP.getVcc(),
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+#endif
 
   const uint32_t interval = alertActive() ? 250 : 1000;   // the age line ticks on the alert screen
   if (dirty || now - lastRender >= interval) {

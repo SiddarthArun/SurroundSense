@@ -6,7 +6,8 @@
 //   peak normalize (0.95, max +20 dB)    -> src/yamdetector/audio.py peak_normalize
 //   microfrontend, fresh state per window -> src/yamdetector/features.py (op defaults, PCAN on)
 //   divide by 255, quantize round(f / scale + zp) -> export.py evaluate_tflite
-// then prints a probability line per window and an Event line on a detection.
+// then prints a probability line per window and an Event line on a detection. The same window,
+// from all four mics, goes to doa.h for the direction.
 
 #pragma once
 #include <math.h>
@@ -34,8 +35,10 @@ constexpr float kValueScale = 255.0f;   // features.value_scale
 static_assert(kYamOutputClasses == CLS_COUNT,
               "model.h and protocol.h list a different number of classes: re-export, or update CLASS_NAMES");
 
-int16_t  ring[WIN_SAMPLES];   // last 1 s of mic 1
-int16_t  win[WIN_SAMPLES];    // window being classified (oldest sample first)
+#include "doa.h"   // direction; uses WIN_SAMPLES
+
+int16_t *ring = nullptr;      // last 1 s of every mic, CH channels interleaved (PSRAM)
+int16_t  win[WIN_SAMPLES];    // window being classified: mic 1, oldest sample first
 int      ringPos = 0;
 bool     ringFull = false;
 int      blocksSinceRun = 0;
@@ -43,6 +46,7 @@ uint32_t lastEventMs[CLS_COUNT];
 uint32_t eventCount = 0;
 uint8_t  lastEventClass = CLS_BACKGROUND;   // latest Event, read by room_capture's radio code
 uint8_t  lastEventConf  = 0;                // 0-255, the confidence the band displays
+uint8_t  lastEventDir   = DIR_UNKNOWN;      // where it came from, from doa.h
 
 FrontendState             frontend;
 tflite::MicroInterpreter *interpreter = nullptr;
@@ -104,7 +108,7 @@ void inferSetup() {
     arena = (uint8_t *)heap_caps_malloc(ARENA_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     where = "PSRAM";
   }
-  if (!arena) inferFail("no memory for the tensor arena");
+  if (!arena) inferFail("no memory for the tensor arena: is Tools > PSRAM set to OPI PSRAM?");
 
   static tflite::MicroInterpreter interp(model, resolver, arena, ARENA_BYTES);
   interpreter = &interp;
@@ -120,9 +124,21 @@ void inferSetup() {
     inferFail("model output is not int8 with CLS_COUNT classes");
   }
 
+  ring = (int16_t *)heap_caps_malloc(WIN_SAMPLES * CH * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!ring) inferFail("no memory for the audio ring: is Tools > PSRAM set to OPI PSRAM?");
+
   Serial.printf("[yamDetector] ready: model %u B, arena used %u of %u B (%s), threshold %.2f\n",
                 g_yam_model_tflite_len, (unsigned)interpreter->arena_used_bytes(),
                 (unsigned)ARENA_BYTES, where, DETECT_THRESHOLD);
+  if (doaSetup()) Serial.printf("[yamDetector] direction: on, %d directions\n", DOA_SECTORS);
+  else            Serial.println("[yamDetector] direction: off (needs all 4 mics, PDM_LINES 2)");
+}
+
+// "front-R" -> "FRONT-R", for the Event line.
+void upperCopy(char *dst, const char *src, size_t n) {
+  size_t i = 0;
+  for (; src[i] && i < n - 1; i++) dst[i] = (char)toupper(src[i]);
+  dst[i] = '\0';
 }
 
 // Classify win[]. Returns false on a silent window (nothing to classify).
@@ -196,26 +212,38 @@ bool inferRun() {
   Serial.printf("| gain %4.1f | %lu ms\n", gain, (unsigned long)(now - t0));
 #endif
 
-  if (best != CLS_BACKGROUND && prob[best] >= DETECT_THRESHOLD &&
-      (lastEventMs[best] == 0 || now - lastEventMs[best] >= COOLDOWN_MS)) {
+  const bool isEvent = best != CLS_BACKGROUND && prob[best] >= DETECT_THRESHOLD &&
+                       (lastEventMs[best] == 0 || now - lastEventMs[best] >= COOLDOWN_MS);
+
+  // Direction from all four mics over this same window (ring still holds exactly it).
+  DoaResult where{};   // dir 0 = DIR_UNKNOWN until estimated
+  if (isEvent || DOA_PRINT) {
+    doaEstimate(ring, ringPos, &where);
+#if DOA_PRINT
+    doaPrint(where);
+#endif
+  }
+
+  if (isEvent) {
     lastEventMs[best] = now;
     eventCount++;
     lastEventClass = (uint8_t)best;
     lastEventConf  = (uint8_t)lroundf(prob[best] * 255.0f);
-    char name[24];
-    size_t i = 0;
-    for (; CLASS_NAMES[best][i] && i < sizeof(name) - 1; i++) name[i] = toupper(CLASS_NAMES[best][i]);
-    name[i] = '\0';
-    Serial.printf("[yamDetector] Event: %s | Conf: %d%% | #%lu\n", name, (int)lroundf(prob[best] * 100.0f),
-                  (unsigned long)eventCount);
+    lastEventDir   = where.dir;
+    char name[24], dir[12];
+    upperCopy(name, CLASS_NAMES[best], sizeof(name));
+    upperCopy(dir, DIR_NAMES[where.dir], sizeof(dir));
+    Serial.printf("[yamDetector] Event: %s | Conf: %d%% | Dir: %s | #%lu\n", name,
+                  (int)lroundf(prob[best] * 100.0f), dir, (unsigned long)eventCount);
   }
   return true;
 }
 
 // Feed one processed block (mic order, CH channels interleaved). Mic 1 = channel 0.
+// The ring keeps every mic: the classifier reads mic 1, doa.h reads all four.
 void inferPushBlock(const int16_t *blk, int frames, int channels) {
   for (int f = 0; f < frames; f++) {
-    ring[ringPos] = blk[f * channels];
+    memcpy(&ring[ringPos * CH], &blk[f * channels], CH * sizeof(int16_t));
     if (++ringPos == WIN_SAMPLES) {
       ringPos = 0;
       ringFull = true;
@@ -223,6 +251,6 @@ void inferPushBlock(const int16_t *blk, int frames, int channels) {
   }
   if (!ringFull || ++blocksSinceRun < HOP_BLOCKS) return;
   blocksSinceRun = 0;
-  for (int i = 0; i < WIN_SAMPLES; i++) win[i] = ring[(ringPos + i) % WIN_SAMPLES];
+  for (int i = 0; i < WIN_SAMPLES; i++) win[i] = ring[((ringPos + i) % WIN_SAMPLES) * CH];
   inferRun();
 }

@@ -14,12 +14,13 @@
 //   4. Still dropping blocks? STREAM_CHANNELS 1 sends mic 1 only (recorder.py --channels 1).
 //   5. MODE_INFER. Train, then `python export.py --firmware-dir room_capture` (writes model.h
 //      here). Upload, open Serial Monitor: probabilities every 0.5 s, Event lines on a
-//      detection, and each Event broadcast over ESP-NOW to the wristband (wristband/).
-//      Settings at the top of yam_infer.h.
+//      detection with the direction it came from, and each Event broadcast over ESP-NOW to the
+//      wristband (wristband/). Settings at the top of yam_infer.h (classifier) and doa.h
+//      (direction, including which mic is worn where).
 //
-// Wiring (all mics: 3V -> 3V3, GND -> GND):
-//   Mic 1: CLK D0, DAT D1, SEL GND     Mic 2: CLK D0, DAT D1, SEL 3V3
-//   Mic 3: CLK D0, DAT D3, SEL GND     Mic 4: CLK D0, DAT D3, SEL 3V3
+// Wiring (all mics: 3V -> 3V3, GND -> GND), and where each is worn on the harness:
+//   Mic 1: CLK D0, DAT D1, SEL GND  chest, right    Mic 2: CLK D0, DAT D1, SEL 3V3  chest, left
+//   Mic 3: CLK D0, DAT D3, SEL GND  back, right     Mic 4: CLK D0, DAT D3, SEL 3V3  back, left
 
 #include "driver/i2s_pdm.h"
 #include <protocol.h>
@@ -56,6 +57,9 @@ const uint8_t SLOT_FOR_MIC[CH] = {1, 0};
 constexpr size_t PAYLOAD_BYTES = FRAMES * STREAM_CHANNELS * sizeof(int16_t);
 
 #if MODE == MODE_INFER
+#ifndef BOARD_HAS_PSRAM
+#error "MODE_INFER needs Tools > PSRAM: OPI PSRAM. Wi-Fi takes internal RAM, so the tensor arena lives in PSRAM."
+#endif
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
@@ -129,6 +133,7 @@ bool startMics() {
 static const uint8_t WRIST_ADDR[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 uint16_t radioSeq = 0;
+esp_err_t lastSendErr = ESP_OK;
 uint32_t sentEvents = 0;
 uint32_t lastHeartbeat = 0;
 volatile bool     ackPending = false;
@@ -146,37 +151,90 @@ void onRadioRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) 
   ackPending = true;
 }
 
+// Puts the radio on ESPNOW_CHANNEL; returns the channel it actually ended up on.
+// The promiscuous toggle is what makes the change stick on an idle station.
+uint8_t setHomeChannel() {
+  esp_wifi_set_promiscuous(true);
+  const esp_err_t err = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  uint8_t primary = 0;
+  wifi_second_chan_t second;
+  esp_wifi_get_channel(&primary, &second);
+  if (err != ESP_OK || primary != ESPNOW_CHANNEL) {
+    Serial.printf("[yamDetector] radio: set channel %d failed (%s), radio is on %u\n",
+                  ESPNOW_CHANNEL, esp_err_to_name(err), (unsigned)primary);
+  }
+  return primary;
+}
+
 bool radioSetup() {
-  WiFi.mode(WIFI_STA);
+  // Keep the station idle: a saved SSID or an auto-reconnect makes it scan, which hops channels
+  // and makes ESP-NOW refuse every send ("Peer channel is not equal to the home channel").
+  WiFi.persistent(false);          // ignore any SSID an earlier sketch saved to flash
+  if (!WiFi.mode(WIFI_STA)) {
+    // Wi-Fi buffers must come from internal RAM; this says whether that is what ran out.
+    Serial.printf("[yamDetector] radio: WiFi.mode failed, internal heap free %u B, largest block %u B\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return false;
+  }
+  WiFi.setAutoReconnect(false);
   WiFi.disconnect();
-  if (esp_now_init() != ESP_OK) return false;
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  const uint8_t onChannel = setHomeChannel();
+  esp_err_t err = esp_now_init();
+  if (err != ESP_OK) {
+    Serial.printf("[yamDetector] radio: esp_now_init failed (%s)\n", esp_err_to_name(err));
+    return false;
+  }
   esp_now_register_recv_cb(onRadioRecv);   // the ACK is the delivery report
-  Serial.printf("[yamDetector] radio: ESP-NOW channel %d, alerts broadcast\n", ESPNOW_CHANNEL);
+
+  // ESP-IDF only sends to addresses in its peer list, the broadcast address included.
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, WRIST_ADDR, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.ifidx   = WIFI_IF_STA;
+  peer.encrypt = false;
+  err = esp_now_add_peer(&peer);
+  if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf("[yamDetector] radio: add_peer failed (%s)\n", esp_err_to_name(err));
+    return false;
+  }
+  Serial.printf("[yamDetector] radio: ESP-NOW channel %d (radio on %u), alerts broadcast\n",
+                ESPNOW_CHANNEL, (unsigned)onChannel);
   return true;
 }
 
-void radioSend(uint8_t type, uint8_t cls, uint8_t conf) {
+void radioSend(uint8_t type, uint8_t cls, uint8_t conf, uint8_t dir) {
   msg_t m = {};
   m.type     = type;
   m.class_id = cls;
   m.conf     = conf;
-  m.zone     = 0;   // direction estimation is not built yet
+  m.dir      = dir;
   m.seq      = ++radioSeq;
   m.t_ms     = millis();
-  esp_now_send(WRIST_ADDR, (const uint8_t *)&m, sizeof(m));
+  // Print only when the status changes, so a failure shows once instead of every heartbeat.
+  esp_err_t err = esp_now_send(WRIST_ADDR, (const uint8_t *)&m, sizeof(m));
+  if (err == ESP_ERR_ESPNOW_CHAN) {   // something moved the radio: put it back and retry once
+    setHomeChannel();
+    err = esp_now_send(WRIST_ADDR, (const uint8_t *)&m, sizeof(m));
+  }
+  if (err != lastSendErr) {
+    lastSendErr = err;
+    if (err == ESP_OK) Serial.println("[yamDetector] radio: sending again");
+    else Serial.printf("[yamDetector] radio: send failed (%s)\n", esp_err_to_name(err));
+  }
 }
 
 // Runs after every audio block: forwards a new Event, keeps the link alive, reports ACKs.
 void radioLoop() {
   if (eventCount != sentEvents) {
     sentEvents = eventCount;
-    radioSend(MSG_ALERT, lastEventClass, lastEventConf);
+    radioSend(MSG_ALERT, lastEventClass, lastEventConf, lastEventDir);
   }
   const uint32_t now = millis();
   if (now - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = now;
-    radioSend(MSG_HEARTBEAT, CLS_BACKGROUND, 0);
+    radioSend(MSG_HEARTBEAT, CLS_BACKGROUND, 0, DIR_UNKNOWN);
   }
   if (ackPending) {
     ackPending = false;
@@ -194,10 +252,12 @@ void setup() {
 #if MODE == MODE_INFER
   const uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 3000) delay(10);   // give the Serial Monitor a moment
+  // Radio first: Wi-Fi buffers must be internal RAM, while the tensor arena can fall back to PSRAM.
+  const bool radioOk = radioSetup();
   inferSetup();
   // One MSG_TEST at boot: the band shows it as TEST and buzzes, which checks the radio path
   // without waiting for a real siren.
-  if (radioSetup()) radioSend(MSG_TEST, CLS_SIREN, 0);
+  if (radioOk) radioSend(MSG_TEST, CLS_SIREN, 0, DIR_UNKNOWN);
   else Serial.println("[yamDetector] radio: ESP-NOW init failed, alerts will not be sent");
 #endif
   if (!startMics()) fail();

@@ -37,12 +37,30 @@ enum : uint8_t {
 };
 static const char *const CLASS_NAMES[CLS_COUNT] = {"siren", "car_horn", "alarm", "knock", "background"};
 
+// Where a sound came from, relative to the wearer (chest = front). The room unit's doa.h sends
+// FRONT / RIGHT / BEHIND / LEFT, or all eight with DOA_SECTORS 8.
+enum : uint8_t {
+  DIR_UNKNOWN      = 0,
+  DIR_FRONT        = 1,
+  DIR_FRONT_RIGHT  = 2,
+  DIR_RIGHT        = 3,
+  DIR_BEHIND_RIGHT = 4,
+  DIR_BEHIND       = 5,
+  DIR_BEHIND_LEFT  = 6,
+  DIR_LEFT         = 7,
+  DIR_FRONT_LEFT   = 8,
+  DIR_COUNT        = 9,
+};
+// At most 10 characters each, so the wristband can show them in large text.
+static const char *const DIR_NAMES[DIR_COUNT] = {"unknown", "front",  "front-R",  "right", "behind-R",
+                                                 "behind",  "behind-L", "left",   "front-L"};
+
 // Radio message: 10 bytes, identical layout on ESP32 and ESP8266
 typedef struct __attribute__((packed)) {
   uint8_t  type;      // MSG_*
   uint8_t  class_id;  // CLS_* or custom 8-15
   uint8_t  conf;      // confidence 0-255
-  uint8_t  zone;      // 0 unknown, 1-5 named zones
+  uint8_t  dir;       // DIR_*: where the sound came from
   uint16_t seq;       // spots drops and duplicates
   uint32_t t_ms;      // sender's clock; the wrist echoes it in its ACK
 } msg_t;
