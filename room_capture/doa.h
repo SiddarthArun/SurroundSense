@@ -1,4 +1,4 @@
-// doa.h: which side of the wearer a sound came from. Included from yam_infer.h (MODE_INFER),
+// doa.h: which side of the wearer a sound came from. Included from classifier.h (MODE_INFER),
 // after WIN_SAMPLES. Needs all four mics (PDM_LINES 2).
 //
 // The mics are on a harness: mics 1-2 on the chest, mics 3-4 on the back, a 30 x 30 cm square
@@ -224,7 +224,7 @@ void doaEstimate(const int16_t *ring, int head, DoaResult *r) {
 
 void doaPrint(const DoaResult &r) {
   if (!r.loud) return;
-  Serial.printf("[yamDetector] dir %-8s az %3.0f | front/behind %+.2f (time %+.2f, level %+5.1f dB)"
+  Serial.printf("[SurroundSense] dir %-8s az %3.0f | front/behind %+.2f (time %+.2f, level %+5.1f dB)"
                 " | right/left %+.2f (time %+.2f, level %+5.1f dB) | %lu ms\n",
                 DIR_NAMES[r.dir], r.azimuth, r.score[0], r.timing[0], r.levelDb[0],
                 r.score[1], r.timing[1], r.levelDb[1], (unsigned long)r.ms);

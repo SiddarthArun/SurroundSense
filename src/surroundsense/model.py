@@ -6,7 +6,7 @@ grows 64 -> 96 -> 128 -> 160 -> 192.
 
 ~92k parameters and ~9.5M MACs, which is about 2.4x the compute of the original
 5-class model (38 ms/window on the S3, so roughly 90-110 ms): comfortably inside
-the 0.5 s hop in ``yam_infer.h`` while giving a 13-class softmax enough capacity
+the 0.5 s hop in ``classifier.h`` while giving a 13-class softmax enough capacity
 to separate scream from speech and knock from thunder.
 
 The input/output contract is unchanged: ``(49, 40, 1)`` float features in,
@@ -20,7 +20,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-MODEL_NAME = "yam_dscnn"
+MODEL_NAME = "surround_dscnn"
 L2_WEIGHT = 1e-4
 SPATIAL_DROPOUT = 0.15
 

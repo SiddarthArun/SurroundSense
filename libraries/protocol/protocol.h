@@ -19,7 +19,8 @@
 #define FRAME_TYPE_AUDIO 0x01
 #define FRAME_TYPE_EVENT 0x02
 
-// Radio message types
+// Radio message types. MSG_HEARTBEAT goes every second and carries the harness's current top
+// class (any class, with its confidence and direction): the band shows it, never buzzes for it.
 enum : uint8_t { MSG_ALERT = 1, MSG_HEARTBEAT = 2, MSG_ACK = 3, MSG_TEST = 4 };
 
 // Sound classes: the ids on the radio. The harness matches its model's output names

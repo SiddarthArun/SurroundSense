@@ -1,10 +1,10 @@
-// yam_infer.h: on-device classifier for room_capture (MODE_INFER only).
+// classifier.h: on-device classifier for room_capture (MODE_INFER only).
 // Included once, from room_capture.ino. MODEL_CLASSES below picks the model header;
 // `python export.py --firmware-dir room_capture` writes a new model.h.
 //
 // Every 0.5 s it takes the last 1 s of mic 1 and runs the same steps as training:
-//   peak normalize (0.95, max +20 dB)    -> src/yamdetector/audio.py peak_normalize
-//   microfrontend, fresh state per window -> src/yamdetector/features.py (op defaults, PCAN on)
+//   peak normalize (0.95, max +20 dB)    -> src/surroundsense/audio.py peak_normalize
+//   microfrontend, fresh state per window -> src/surroundsense/features.py (op defaults, PCAN on)
 //   divide by 255, quantize round(f / scale + zp) -> export.py evaluate_tflite
 // then prints a probability line per window and an Event line on a detection. The same window,
 // from all four mics, goes to doa.h for the direction.
@@ -79,14 +79,14 @@ constexpr float kPeakTarget = 0.95f;    // audio.peak_target
 constexpr float kMaxGain    = 10.0f;    // audio.max_gain_db = 20 dB
 constexpr float kValueScale = 255.0f;   // features.value_scale
 
-static_assert(kYamOutputClasses <= CLS_COUNT,
+static_assert(kModelOutputClasses <= CLS_COUNT,
               "the model has more classes than protocol.h: add them to CLASS_NAMES, CLS_* and CLASS_ALERT");
 
 #include "doa.h"   // direction; uses WIN_SAMPLES
 
 // Model output index -> protocol.h class id (CLS_*), filled by name in inferSetup. The radio and
 // the wristband only ever see protocol ids, so a model may have fewer classes or another order.
-uint8_t modelClass[kYamOutputClasses];
+uint8_t modelClass[kModelOutputClasses];
 
 // An alert-tier class (CLASS_ALERT) that is also listed in ALERT_ON.
 bool alertOn(int c) {
@@ -107,6 +107,11 @@ uint32_t eventCount = 0;
 uint8_t  lastEventClass = CLS_BACKGROUND;   // latest Event, read by room_capture's radio code
 uint8_t  lastEventConf  = 0;                // 0-255, the confidence the band displays
 uint8_t  lastEventDir   = DIR_UNKNOWN;      // where it came from, from doa.h
+// Top class of the latest window, Event or not: room_capture sends it in every heartbeat for the
+// band's "hearing" line. liveDir is only known when the window ran doa.h (an Event, or DOA_PRINT).
+uint8_t  liveClass = CLS_BACKGROUND;
+uint8_t  liveConf  = 0;
+uint8_t  liveDir   = DIR_UNKNOWN;
 
 FrontendState             frontend;
 tflite::MicroInterpreter *interpreter = nullptr;
@@ -117,7 +122,7 @@ TfLiteTensor             *outputT = nullptr;
 void inferFail(const char *msg) {
   pinMode(LED_BUILTIN, OUTPUT);
   while (true) {
-    Serial.printf("[yamDetector] ERROR: %s\n", msg);
+    Serial.printf("[SurroundSense] ERROR: %s\n", msg);
     for (int i = 0; i < 10; i++) {
       digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
       delay(200);
@@ -133,7 +138,7 @@ void inferSetup() {
   FrontendFillConfigWithDefaults(&cfg);
   cfg.window.size_ms                         = 30;
   cfg.window.step_size_ms                    = 20;
-  cfg.filterbank.num_channels                = kYamInputChannels;
+  cfg.filterbank.num_channels                = kModelInputChannels;
   cfg.filterbank.lower_band_limit            = 125.0f;
   cfg.filterbank.upper_band_limit            = 7500.0f;
   cfg.noise_reduction.smoothing_bits         = 10;
@@ -148,7 +153,7 @@ void inferSetup() {
   cfg.log_scale.scale_shift                  = 6;
   if (!FrontendPopulateState(&cfg, &frontend, AUDIO_SAMPLE_RATE)) inferFail("microfrontend setup failed");
 
-  const tflite::Model *model = tflite::GetModel(g_yam_model_tflite);
+  const tflite::Model *model = tflite::GetModel(g_model_tflite);
   if (model->version() != TFLITE_SCHEMA_VERSION) inferFail("model.h schema version does not match TFLite Micro");
 
   static tflite::MicroMutableOpResolver<9> resolver;
@@ -177,16 +182,16 @@ void inferSetup() {
   }
   inputT = interpreter->input(0);
   outputT = interpreter->output(0);
-  if (inputT->type != kTfLiteInt8 || inputT->bytes != (size_t)(kYamInputFrames * kYamInputChannels)) {
+  if (inputT->type != kTfLiteInt8 || inputT->bytes != (size_t)(kModelInputFrames * kModelInputChannels)) {
     inferFail("model input is not int8 49x40: re-export with export.py");
   }
-  if (outputT->type != kTfLiteInt8 || outputT->dims->data[outputT->dims->size - 1] != kYamOutputClasses) {
-    inferFail("model output is not int8 with kYamOutputClasses classes");
+  if (outputT->type != kTfLiteInt8 || outputT->dims->data[outputT->dims->size - 1] != kModelOutputClasses) {
+    inferFail("model output is not int8 with kModelOutputClasses classes");
   }
-  for (int i = 0; i < kYamOutputClasses; i++) {
+  for (int i = 0; i < kModelOutputClasses; i++) {
     int id = -1;
     for (int c = 0; c < CLS_COUNT; c++) {
-      if (strcmp(kYamLabels[i], CLASS_NAMES[c]) == 0) id = c;
+      if (strcmp(kModelLabels[i], CLASS_NAMES[c]) == 0) id = c;
     }
     if (id < 0) inferFail("the model header names a class that CLASS_NAMES in protocol.h doesn't list");
     modelClass[i] = (uint8_t)id;
@@ -195,12 +200,12 @@ void inferSetup() {
   ring = (int16_t *)heap_caps_malloc(WIN_SAMPLES * CH * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!ring) inferFail("no memory for the audio ring: is Tools > PSRAM set to OPI PSRAM?");
 
-  Serial.printf("[yamDetector] ready: model %u B, %d classes, arena used %u of %u B (%s)\n",
-                g_yam_model_tflite_len, kYamOutputClasses, (unsigned)interpreter->arena_used_bytes(),
+  Serial.printf("[SurroundSense] ready: model %u B, %d classes, arena used %u of %u B (%s)\n",
+                g_model_tflite_len, kModelOutputClasses, (unsigned)interpreter->arena_used_bytes(),
                 (unsigned)ARENA_BYTES, where);
-  Serial.print("[yamDetector] alerts on:");
+  Serial.print("[SurroundSense] alerts on:");
   int alerts = 0;
-  for (int i = 0; i < kYamOutputClasses; i++) {
+  for (int i = 0; i < kModelOutputClasses; i++) {
     const int c = modelClass[i];
     if (alertOn(c)) {
       Serial.printf(" %s %.2f", CLASS_NAMES[c], CLASS_THRESHOLD[c]);
@@ -208,8 +213,8 @@ void inferSetup() {
     }
   }
   Serial.println(alerts ? "" : " none (ALERT_ON lists no class this model has)");
-  if (doaSetup()) Serial.printf("[yamDetector] direction: on, %d directions\n", DOA_SECTORS);
-  else            Serial.println("[yamDetector] direction: off (needs all 4 mics, PDM_LINES 2)");
+  if (doaSetup()) Serial.printf("[SurroundSense] direction: on, %d directions\n", DOA_SECTORS);
+  else            Serial.println("[SurroundSense] direction: off (needs all 4 mics, PDM_LINES 2)");
 }
 
 // "front-R" -> "FRONT-R", for the Event line.
@@ -255,32 +260,32 @@ bool inferRun() {
     p += used;
     left -= used;
     if (out.values != nullptr) {
-      if (frames < kYamInputFrames) {
+      if (frames < kModelInputFrames) {
         for (size_t c = 0; c < out.size; c++) {
           long q = lrintf((float)out.values[c] / kValueScale / inScale + (float)inZero);
           if (q > 127) q = 127;
           if (q < -128) q = -128;
-          in[frames * kYamInputChannels + c] = (int8_t)q;
+          in[frames * kModelInputChannels + c] = (int8_t)q;
         }
       }
       frames++;
     }
     if (used == 0 && out.values == nullptr) break;   // safety: no progress
   }
-  if (frames != kYamInputFrames) {
-    Serial.printf("[yamDetector] ERROR: microfrontend gave %d frames, model wants %d\n", frames, kYamInputFrames);
+  if (frames != kModelInputFrames) {
+    Serial.printf("[SurroundSense] ERROR: microfrontend gave %d frames, model wants %d\n", frames, kModelInputFrames);
     return false;
   }
 
   if (interpreter->Invoke() != kTfLiteOk) {
-    Serial.println("[yamDetector] ERROR: Invoke failed");
+    Serial.println("[SurroundSense] ERROR: Invoke failed");
     return false;
   }
 
   // Probabilities by protocol.h class id; classes this model doesn't have stay at 0.
   float prob[CLS_COUNT] = {};
   int best = modelClass[0];
-  for (int i = 0; i < kYamOutputClasses; i++) {
+  for (int i = 0; i < kModelOutputClasses; i++) {
     const int c = modelClass[i];
     prob[c] = (outputT->data.int8[i] - outputT->params.zero_point) * outputT->params.scale;
     if (prob[c] > prob[best]) best = c;
@@ -288,7 +293,7 @@ bool inferRun() {
   const uint32_t now = millis();
 
 #if PRINT_PROBS
-  for (int i = 0; i < kYamOutputClasses; i++) Serial.printf("%s %.2f  ", kYamLabels[i], prob[modelClass[i]]);
+  for (int i = 0; i < kModelOutputClasses; i++) Serial.printf("%s %.2f  ", kModelLabels[i], prob[modelClass[i]]);
   Serial.printf("| gain %4.1f | %lu ms\n", gain, (unsigned long)(now - t0));
 #endif
 
@@ -306,6 +311,10 @@ bool inferRun() {
 #endif
   }
 
+  liveClass = (uint8_t)best;
+  liveConf  = (uint8_t)lroundf(prob[best] * 255.0f);
+  liveDir   = where.dir;
+
   if (isEvent) {
     lastEventMs[best] = now;
     eventCount++;
@@ -315,7 +324,7 @@ bool inferRun() {
     char name[24], dir[12];
     upperCopy(name, CLASS_NAMES[best], sizeof(name));
     upperCopy(dir, DIR_NAMES[where.dir], sizeof(dir));
-    Serial.printf("[yamDetector] Event: %s | Conf: %d%% | Dir: %s | #%lu\n", name,
+    Serial.printf("[SurroundSense] Event: %s | Conf: %d%% | Dir: %s | #%lu\n", name,
                   (int)lroundf(prob[best] * 100.0f), dir, (unsigned long)eventCount);
   }
   return true;

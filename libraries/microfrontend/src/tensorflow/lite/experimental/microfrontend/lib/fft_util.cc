@@ -19,7 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <cstdlib>
 
-// yamDetector: use the int16 kissfft already compiled into the ESP32 core's TFLite Micro.
+// Surround Sense: use the int16 kissfft already compiled into the ESP32 core's TFLite Micro.
 #include "signal/src/kiss_fft_wrappers/kiss_fft_int16.h"
 using namespace kiss_fft_fixed16;
 

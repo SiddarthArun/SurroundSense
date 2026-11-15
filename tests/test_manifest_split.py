@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from yamdetector import manifest  # noqa: E402
+from surroundsense import manifest  # noqa: E402
 
 FOLD_MAP = {"train": [1, 2, 3], "val": [4], "test": [5]}
 RATIOS = {"train": 0.70, "val": 0.15, "test": 0.15}

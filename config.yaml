@@ -1,4 +1,4 @@
-# yamDetector - audio event classifier for an ESP32-S3 wearable (TFLite Micro)
+# Surround Sense - audio event classifier for an ESP32-S3 wearable (TFLite Micro)
 #
 # Every stage reads this file. Paths are relative to the project root
 # (the directory containing this file) unless they are absolute.

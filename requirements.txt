@@ -1,4 +1,4 @@
-# yamDetector runtime requirements (CPU training works on Windows/macOS/Linux).
+# Surround Sense runtime requirements (CPU training works on Windows/macOS/Linux).
 #
 # GPU training: TensorFlow has no native CUDA support on Windows. For the
 # RTX 3050, run these stages inside WSL2 (Ubuntu) or Linux and install the

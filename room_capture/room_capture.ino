@@ -15,7 +15,7 @@
 //   5. MODE_INFER. Train, then `python export.py --firmware-dir room_capture` (writes model.h
 //      here). Upload, open Serial Monitor: probabilities every 0.5 s, Event lines on a
 //      detection with the direction it came from, and each Event broadcast over ESP-NOW to the
-//      wristband (wristband/). Settings at the top of yam_infer.h (classifier) and doa.h
+//      wristband (wristband/). Settings at the top of classifier.h (sound class) and doa.h
 //      (direction, including which mic is worn where).
 //
 // Wiring (all mics: 3V -> 3V3, GND -> GND), and where each is worn on the harness:
@@ -63,7 +63,7 @@ constexpr size_t PAYLOAD_BYTES = FRAMES * STREAM_CHANNELS * sizeof(int16_t);
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
-#include "yam_infer.h"   // classifier; MODEL_CLASSES and ALERT_ON at its top
+#include "classifier.h"   // sound classifier; MODEL_CLASSES and ALERT_ON at its top
 #endif
 
 i2s_chan_handle_t rxChan = nullptr;
@@ -125,7 +125,9 @@ bool startMics() {
 
 // ---------- radio: ESP-NOW alerts to the wristband (MODE_INFER only) ----------
 #if MODE == MODE_INFER
-#define HEARTBEAT_MS 5000
+// The heartbeat carries the latest window's top class, so the band's "hearing" line stays live.
+// The band never buzzes on a heartbeat: only MSG_ALERT (an ALERT_ON class) does that.
+#define HEARTBEAT_MS 1000
 
 // Broadcast on purpose: the band learns this board's MAC from each message and sends its ACK
 // straight back, so there is no MAC to paste. Put the band's MAC here (bringup/esp01_hello)
@@ -136,6 +138,8 @@ uint16_t radioSeq = 0;
 esp_err_t lastSendErr = ESP_OK;
 uint32_t sentEvents = 0;
 uint32_t lastHeartbeat = 0;
+uint16_t alertSeq = 0;        // seq of the last alert or test, whose ACK always prints
+uint32_t lastAckPrint = 0;
 volatile bool     ackPending = false;
 volatile uint16_t ackSeq = 0;
 volatile uint32_t ackRttMs = 0;
@@ -161,7 +165,7 @@ uint8_t setHomeChannel() {
   wifi_second_chan_t second;
   esp_wifi_get_channel(&primary, &second);
   if (err != ESP_OK || primary != ESPNOW_CHANNEL) {
-    Serial.printf("[yamDetector] radio: set channel %d failed (%s), radio is on %u\n",
+    Serial.printf("[SurroundSense] radio: set channel %d failed (%s), radio is on %u\n",
                   ESPNOW_CHANNEL, esp_err_to_name(err), (unsigned)primary);
   }
   return primary;
@@ -173,7 +177,7 @@ bool radioSetup() {
   WiFi.persistent(false);          // ignore any SSID an earlier sketch saved to flash
   if (!WiFi.mode(WIFI_STA)) {
     // Wi-Fi buffers must come from internal RAM; this says whether that is what ran out.
-    Serial.printf("[yamDetector] radio: WiFi.mode failed, internal heap free %u B, largest block %u B\n",
+    Serial.printf("[SurroundSense] radio: WiFi.mode failed, internal heap free %u B, largest block %u B\n",
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return false;
@@ -183,7 +187,7 @@ bool radioSetup() {
   const uint8_t onChannel = setHomeChannel();
   esp_err_t err = esp_now_init();
   if (err != ESP_OK) {
-    Serial.printf("[yamDetector] radio: esp_now_init failed (%s)\n", esp_err_to_name(err));
+    Serial.printf("[SurroundSense] radio: esp_now_init failed (%s)\n", esp_err_to_name(err));
     return false;
   }
   esp_now_register_recv_cb(onRadioRecv);   // the ACK is the delivery report
@@ -196,10 +200,10 @@ bool radioSetup() {
   peer.encrypt = false;
   err = esp_now_add_peer(&peer);
   if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
-    Serial.printf("[yamDetector] radio: add_peer failed (%s)\n", esp_err_to_name(err));
+    Serial.printf("[SurroundSense] radio: add_peer failed (%s)\n", esp_err_to_name(err));
     return false;
   }
-  Serial.printf("[yamDetector] radio: ESP-NOW channel %d (radio on %u), alerts broadcast\n",
+  Serial.printf("[SurroundSense] radio: ESP-NOW channel %d (radio on %u), alerts broadcast\n",
                 ESPNOW_CHANNEL, (unsigned)onChannel);
   return true;
 }
@@ -220,8 +224,8 @@ void radioSend(uint8_t type, uint8_t cls, uint8_t conf, uint8_t dir) {
   }
   if (err != lastSendErr) {
     lastSendErr = err;
-    if (err == ESP_OK) Serial.println("[yamDetector] radio: sending again");
-    else Serial.printf("[yamDetector] radio: send failed (%s)\n", esp_err_to_name(err));
+    if (err == ESP_OK) Serial.println("[SurroundSense] radio: sending again");
+    else Serial.printf("[SurroundSense] radio: send failed (%s)\n", esp_err_to_name(err));
   }
 }
 
@@ -230,16 +234,21 @@ void radioLoop() {
   if (eventCount != sentEvents) {
     sentEvents = eventCount;
     radioSend(MSG_ALERT, lastEventClass, lastEventConf, lastEventDir);
+    alertSeq = radioSeq;
   }
   const uint32_t now = millis();
   if (now - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = now;
-    radioSend(MSG_HEARTBEAT, CLS_BACKGROUND, 0, DIR_UNKNOWN);
+    radioSend(MSG_HEARTBEAT, liveClass, liveConf, liveDir);
   }
+  // Heartbeats go every second, so their ACKs print at most every 5 s; an alert's ACK always prints.
   if (ackPending) {
     ackPending = false;
-    Serial.printf("[yamDetector] wristband ACK seq %u, %lu ms\n",
-                  (unsigned)ackSeq, (unsigned long)ackRttMs);
+    if (ackSeq == alertSeq || now - lastAckPrint >= 5000) {
+      lastAckPrint = now;
+      Serial.printf("[SurroundSense] wristband ACK seq %u, %lu ms\n",
+                    (unsigned)ackSeq, (unsigned long)ackRttMs);
+    }
   }
 }
 #endif
@@ -257,8 +266,10 @@ void setup() {
   inferSetup();
   // One MSG_TEST at boot: the band shows it as TEST and buzzes, which checks the radio path
   // without waiting for a real siren.
-  if (radioOk) radioSend(MSG_TEST, CLS_SIREN, 0, DIR_UNKNOWN);
-  else Serial.println("[yamDetector] radio: ESP-NOW init failed, alerts will not be sent");
+  if (radioOk) {
+    radioSend(MSG_TEST, CLS_SIREN, 0, DIR_UNKNOWN);
+    alertSeq = radioSeq;
+  } else Serial.println("[SurroundSense] radio: ESP-NOW init failed, alerts will not be sent");
 #endif
   if (!startMics()) fail();
 }

@@ -32,15 +32,15 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from yamdetector import audio, manifest  # noqa: E402
-from yamdetector.config import ConfigError, load_config, set_seed  # noqa: E402
+from surroundsense import audio, manifest  # noqa: E402
+from surroundsense.config import ConfigError, load_config, set_seed  # noqa: E402
 
 SOURCES = ("fsd50k", "ravdess")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare FSD50K / RAVDESS windows for yamDetector (stage 1b)",
+        description="Prepare FSD50K / RAVDESS windows for Surround Sense (stage 1b)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="path to config.yaml (default: ./config.yaml)")

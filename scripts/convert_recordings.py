@@ -28,8 +28,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from yamdetector import audio, manifest  # noqa: E402
-from yamdetector.config import ConfigError, load_config, set_seed  # noqa: E402
+from surroundsense import audio, manifest  # noqa: E402
+from surroundsense.config import ConfigError, load_config, set_seed  # noqa: E402
 
 AUDIO_SUFFIXES = {
     ".wav",

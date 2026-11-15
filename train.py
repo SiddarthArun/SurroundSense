@@ -25,21 +25,21 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from yamdetector import augment, features, manifest, metrics  # noqa: E402
-from yamdetector.config import (  # noqa: E402
+from surroundsense import augment, features, manifest, metrics  # noqa: E402
+from surroundsense.config import (  # noqa: E402
     ConfigError,
     label_order,
     load_config,
     set_seed,
 )
-from yamdetector.model import build_model, describe  # noqa: E402
+from surroundsense.model import build_model, describe  # noqa: E402
 
 THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.90)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train the yamDetector DS-CNN (stage 3)",
+        description="Train the Surround Sense DS-CNN (stage 3)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="path to config.yaml (default: ./config.yaml)")

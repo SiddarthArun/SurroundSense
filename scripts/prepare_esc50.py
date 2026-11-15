@@ -27,15 +27,15 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from yamdetector import audio, manifest  # noqa: E402
-from yamdetector.config import ConfigError, esc50_paths, load_config, set_seed  # noqa: E402
+from surroundsense import audio, manifest  # noqa: E402
+from surroundsense.config import ConfigError, esc50_paths, load_config, set_seed  # noqa: E402
 
 META_COLUMNS = ("filename", "fold", "category")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare ESC-50 windows for yamDetector (stage 1)",
+        description="Prepare ESC-50 windows for Surround Sense (stage 1)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config", default=None, help="path to config.yaml (default: ./config.yaml)")
