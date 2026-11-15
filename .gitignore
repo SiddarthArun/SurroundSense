@@ -22,3 +22,5 @@ my_recordings_raw/
 libraries/*
 !libraries/protocol/
 !libraries/microfrontend/
+
+data/FSD50K.*/
