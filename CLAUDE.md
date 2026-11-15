@@ -8,7 +8,13 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
 ## Layout
 - `config.yaml`, `scripts/`, `train.py`, `export.py`, `src/yamdetector/`: ML pipeline.
   Training reads only `data/processed/manifest.csv` and `config.yaml`.
-- `data/ESC-50/`: the dataset (read-only).
+  Prep stages: `prepare_esc50.py` (ESC-50), `prepare_datasets.py` (FSD50K + RAVDESS),
+  `convert_recordings.py` (own recordings).
+- `data/ESC-50/`, `data/FSD50K/` + `data/FSD50K.ground_truth/`, `data/ravdess/`: the datasets
+  (read-only). FSD50K ground truth is multi-label; `classes.order` breaks the tie.
+- Class tiers: `classes.alert` (buzzes) vs speech/music/background (silent). Every class is
+  capped in training (`prepare.max_windows_per_class`), background at
+  `prepare.background_ratio` x the average class.
 - `libraries/protocol/protocol.h`: shared constants, `msg_t` (10 bytes), class list.
   Sketches use `#include <protocol.h>`; the Arduino sketchbook location is the repo root.
 - `libraries/microfrontend/`: TensorFlow audio microfrontend C code (vendored; uses the core's kissfft).
@@ -31,8 +37,8 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
   free-field angle maths, so `doa.h` decides front/behind and right/left from timing sign
   (GCC-PHAT) + level difference (1-6 kHz) instead of solving for an angle. Mic positions live in
   `MIC_*` at the top of `doa.h`.
-- MODE_INFER needs PSRAM (OPI): Wi-Fi takes internal RAM first, the tensor arena and the 4-mic
-  ring buffer go to PSRAM. The sketch `#error`s without `BOARD_HAS_PSRAM`.
+- MODE_INFER needs PSRAM (OPI): Wi-Fi takes internal RAM first, the tensor arena (512 KB) and
+  the 4-mic ring buffer go to PSRAM. The sketch `#error`s without `BOARD_HAS_PSRAM`.
 - ESP-NOW on the ESP32 side needs `esp_now_add_peer()` even for broadcast, and the STA kept idle
   (`persistent(false)`, `setAutoReconnect(false)`) so the home channel stays on 1.
 - Serial frame (harness -> laptop, native USB): `A5 5A`, type, seq u16 LE, len u16 LE, payload.
@@ -46,8 +52,9 @@ demo-focused. README.md is the single user-facing doc; don't add more markdown f
   `t_ms`. `msg_t.dir` carries `DIR_*` from `protocol.h` (0 = unknown).
 
 ## Rules
-- Class IDs = model output order = `config.yaml` `classes.order` = `protocol.h` `CLASS_NAMES`.
-  Change all of them together; `export.py` warns on a mismatch.
+- Class IDs = model output order = `config.yaml` `classes.order` = `protocol.h` `CLASS_NAMES`,
+  and `config.yaml` `classes.alert` = `protocol.h` `CLASS_ALERT`. Change all of them together;
+  `export.py` warns on a mismatch and `yam_infer.h` static_asserts the class count.
 - On-device features must match training: DC block, per-window peak normalize
   (0.95, max +20 dB), microfrontend with identical parameters and fresh state per 1 s
   window, divide by 255, quantize with `kYamInputScale` / `kYamInputZeroPoint` from `model.h`.

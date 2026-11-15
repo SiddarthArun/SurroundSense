@@ -7,7 +7,8 @@
 * writes artifacts/model.h (int8 model as a C array) and artifacts/labels.txt
 * prints the int8 input scale / zero point the firmware needs
 * optionally copies model.h into a firmware sketch folder (--firmware-dir)
-* warns when libraries/protocol/protocol.h CLASS_NAMES differ from labels.txt
+* warns when libraries/protocol/protocol.h CLASS_NAMES / CLASS_ALERT differ from
+  labels.txt and classes.alert
 """
 
 from __future__ import annotations
@@ -177,6 +178,45 @@ def protocol_class_names(header: Path) -> list[str] | None:
     return re.findall(r'"([^"]*)"', match.group(1))
 
 
+def protocol_alert_flags(header: Path) -> list[bool] | None:
+    """Read CLASS_ALERT from the firmware's protocol.h; None if it can't be found."""
+    if not header.exists():
+        return None
+    text = header.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"CLASS_ALERT\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", text)
+    if not match:
+        return None
+    return [token == "true" for token in re.findall(r"\b(?:true|false)\b", match.group(1))]
+
+
+def check_protocol_tiers(
+    labels: list[str], alert_labels: set[str], header: Path = PROTOCOL_HEADER
+) -> bool:
+    """Warn when the firmware's alert tiers differ from ``classes.alert``."""
+    flags = protocol_alert_flags(header)
+    if flags is None:
+        print(f"note: no CLASS_ALERT found in {header}; skipped the alert tier check")
+        return True
+    if len(flags) != len(labels):
+        print(
+            f"WARNING: {header.relative_to(PROJECT_ROOT)} CLASS_ALERT has {len(flags)} entries "
+            f"but the model has {len(labels)} classes",
+            file=sys.stderr,
+        )
+        return False
+    expected = [label in alert_labels for label in labels]
+    if flags == expected:
+        print(f"firmware alert tiers match classes.alert ({header.relative_to(PROJECT_ROOT)})")
+        return True
+    mismatched = [label for label, got, want in zip(labels, flags, expected) if got != want]
+    print(
+        "WARNING: protocol.h CLASS_ALERT disagrees with classes.alert for: "
+        + ", ".join(mismatched),
+        file=sys.stderr,
+    )
+    return False
+
+
 def check_protocol_labels(labels: list[str], header: Path = PROTOCOL_HEADER) -> bool:
     """Warn when the firmware class list differs from the model output order."""
     names = protocol_class_names(header)
@@ -251,6 +291,24 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        manifest.assert_unique_paths(rows)
+    except manifest.ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # Same selection train.py used: the per-class caps decide which windows are
+    # part of the dataset, so the exported model is measured on exactly the
+    # windows training held back.
+    budgets = manifest.class_budgets(
+        rows,
+        background_label=cfg["classes"]["background"],
+        background_ratio=float(cfg["prepare"]["background_ratio"]),
+        max_per_class=int(cfg["prepare"]["max_windows_per_class"]),
+        max_background=int(cfg["prepare"]["max_background_windows"]),
+    )
+    rows, selection = manifest.cap_class_windows(rows, budgets, int(cfg["splits"]["seed"]))
+    print(f"dataset: {len(selection)} classes, {len(rows)} window(s) after the per-class caps")
     labels = label_order(cfg, [row["class"] for row in rows])
 
     test_rows = [row for row in rows if row["split"] == "test"]
@@ -343,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         if copied is not None:
             print(f"copied model.h to {copied}")
     check_protocol_labels(labels)
+    check_protocol_tiers(labels, set(cfg["classes"]["alert"]))
 
     print("\nint8 input quantization (needed by the firmware):")
     print(f"  input shape      : {tuple(int(dim) for dim in input_details['shape'])} (int8)")

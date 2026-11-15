@@ -118,7 +118,7 @@ uint8_t confPct(uint8_t conf) {
 const char *nameFor(uint8_t id) {
   static char custom[12];
   if (id < CLS_COUNT) return CLASS_NAMES[id];
-  if (id >= 16) return "unknown";
+  if (id < CLS_CUSTOM_FIRST || id >= 32) return "unknown";
   snprintf(custom, sizeof(custom), "custom %u", (unsigned)id);
   return custom;
 }

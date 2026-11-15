@@ -123,56 +123,142 @@ class AssignSplitsTests(unittest.TestCase):
         self.assertEqual(manifest.assign_splits_by_file([], RATIOS, seed=0), {})
 
 
-class BackgroundSubsampleTests(unittest.TestCase):
-    def build_rows(self, target_per_class: int, background_per_split: dict[str, int]):
+class LabelMappingTests(unittest.TestCase):
+    def test_unmapped_labels_become_background(self):
+        label = manifest.class_for_labels(
+            ["Wind", "Rain"], {"Siren": "siren"}, ["siren", "background"], "background"
+        )
+        self.assertEqual(label, "background")
+
+    def test_order_breaks_multi_label_ties(self):
+        mapping = {"Screaming": "scream", "Speech": "speech", "Music": "music"}
+        order = ["scream", "speech", "music", "background"]
+        self.assertEqual(
+            manifest.class_for_labels(["Music", "Speech", "Screaming"], mapping, order, "background"),
+            "scream",
+        )
+        self.assertEqual(
+            manifest.class_for_labels(["Music", "Speech"], mapping, order, "background"), "speech"
+        )
+
+    def test_label_absent_from_order_still_maps(self):
+        self.assertEqual(
+            manifest.class_for_labels(["Alarm"], {"Alarm": "alarm"}, [], "background"), "alarm"
+        )
+
+
+class UniquePathTests(unittest.TestCase):
+    def test_clean_manifest_passes(self):
+        rows = [
+            make_row("data/processed/siren/a.wav", "siren", "train", "a"),
+            make_row("data/processed/siren/a2.wav", "siren", "train", "a"),
+        ]
+        manifest.assert_unique_paths(rows)  # no raise
+
+    def test_duplicate_path_in_two_splits_raises(self):
+        rows = [
+            make_row("data/processed/background/a.wav", "background", "val", "a"),
+            make_row("data/processed/background/a.wav", "background", "test", "a"),
+        ]
+        with self.assertRaises(manifest.ManifestError):
+            manifest.assert_unique_paths(rows)
+
+    def test_recording_straddling_splits_raises(self):
+        rows = [
+            make_row("data/processed/siren/a_w0.wav", "siren", "train", "clipA"),
+            make_row("data/processed/siren/a_w1.wav", "siren", "test", "clipA"),
+        ]
+        with self.assertRaises(manifest.ManifestError):
+            manifest.assert_unique_paths(rows)
+
+
+class ClassBudgetTests(unittest.TestCase):
+    def test_background_budget_is_ratio_times_average_class(self):
         rows = []
         for label in ("siren", "knock"):
-            for split in manifest.SPLIT_NAMES:
-                for index in range(target_per_class):
-                    rows.append(make_row(f"data/processed/{label}/{split}{index}.wav", label, split, f"{label}{split}{index}"))
-        for split, count in background_per_split.items():
-            for index in range(count):
-                rows.append(
-                    make_row(f"data/processed/background/{split}{index}.wav", "background", split, f"bg{split}{index}")
-                )
+            for index in range(30):
+                rows.append(make_row(f"data/processed/{label}/{index}.wav", label, "train", f"{label}{index}"))
+        for index in range(500):
+            rows.append(make_row(f"data/processed/background/{index}.wav", "background", "train", f"bg{index}"))
+        budgets = manifest.class_budgets(rows, "background", 3.0, 2000)
+        self.assertEqual(budgets["siren"], 2000)  # the flat cap never grows a class
+        self.assertEqual(budgets["background"], 90)  # 3 x 30
+
+    def test_background_has_its_own_larger_cap(self):
+        rows = []
+        for label in ("siren", "knock"):
+            for index in range(30):
+                rows.append(make_row(f"data/processed/{label}/{index}.wav", label, "train", f"{label}{index}"))
+        rows.extend(
+            make_row(f"data/processed/background/{index}.wav", "background", "train", f"bg{index}")
+            for index in range(5000)
+        )
+        # 80 x 30 = 2400 exceeds the flat 2000 cap but stays under the background cap
+        budgets = manifest.class_budgets(rows, "background", 80.0, 2000, max_background=6000)
+        self.assertEqual(budgets["background"], 2400)
+        self.assertEqual(budgets["siren"], 2000)
+
+    def test_background_never_exceeds_its_ceiling(self):
+        rows = []
+        for index in range(30):
+            rows.append(make_row(f"data/processed/siren/{index}.wav", "siren", "train", f"s{index}"))
+        rows.extend(
+            make_row(f"data/processed/background/{index}.wav", "background", "train", f"bg{index}")
+            for index in range(5000)
+        )
+        budgets = manifest.class_budgets(rows, "background", 80.0, 2000, max_background=600)
+        self.assertEqual(budgets["background"], 600)
+
+    def test_flat_cap_limits_a_huge_class(self):
+        rows = [make_row(f"data/processed/music/{i}.wav", "music", "train", f"m{i}") for i in range(50)]
+        rows.append(make_row("data/processed/siren/1.wav", "siren", "train", "s1"))
+        budgets = manifest.class_budgets(rows, "background", 3.0, 20)
+        self.assertEqual(budgets["music"], 20)
+
+
+class ClassCapTests(unittest.TestCase):
+    def build_rows(self, per_class: dict[str, int]):
+        rows = []
+        for label, count in per_class.items():
+            for split, share in (("train", 0.7), ("val", 0.15), ("test", 0.15)):
+                for index in range(int(count * share)):
+                    rows.append(
+                        make_row(
+                            f"data/processed/{label}/{split}{index}.wav",
+                            label,
+                            split,
+                            f"{label}{split}{index}",
+                        )
+                    )
         return rows
 
-    def test_subsamples_to_ratio_of_average_target_class(self):
-        rows = self.build_rows(target_per_class=10, background_per_split={"train": 500, "val": 100, "test": 100})
-        kept, stats = manifest.subsample_background(rows, 4.0, 42, "background", ["siren", "knock"])
-        # two target classes with 30 windows each -> average 30 -> budget 120
-        self.assertEqual(stats["budget"], 120)
-        self.assertEqual(stats["background_kept"], 120)
-        background_kept = [row for row in kept if row["class"] == "background"]
-        self.assertEqual(len(background_kept), 120)
-        self.assertEqual(len({row["path"] for row in background_kept}), 120)
-        # target classes untouched
-        self.assertEqual(len([row for row in kept if row["class"] != "background"]), 60)
+    def test_caps_each_class_and_keeps_it_under_budget(self):
+        rows = self.build_rows({"music": 300, "siren": 20})
+        kept, stats = manifest.cap_class_windows(rows, {"music": 80, "siren": 80}, 42)
+        music = [row for row in kept if row["class"] == "music"]
+        self.assertLessEqual(len(music), 80)
+        self.assertEqual(stats["music"]["kept"], len(music))
+        self.assertEqual(len([row for row in kept if row["class"] == "siren"]), 20)
 
     def test_keeps_split_proportions(self):
-        rows = self.build_rows(target_per_class=10, background_per_split={"train": 500, "val": 100, "test": 100})
-        kept, _ = manifest.subsample_background(rows, 4.0, 42, "background", ["siren", "knock"])
-        splits = Counter(row["split"] for row in kept if row["class"] == "background")
+        rows = self.build_rows({"music": 300, "siren": 20})
+        kept, _ = manifest.cap_class_windows(rows, {"music": 60, "siren": 60}, 42)
+        splits = Counter(row["split"] for row in kept if row["class"] == "music")
         self.assertGreater(splits["train"], splits["val"])
         self.assertGreater(splits["val"], 0)
         self.assertGreater(splits["test"], 0)
 
     def test_deterministic(self):
-        rows = self.build_rows(target_per_class=5, background_per_split={"train": 300, "val": 60, "test": 60})
-        first, _ = manifest.subsample_background(rows, 4.0, 7, "background", ["siren", "knock"])
-        second, _ = manifest.subsample_background(rows, 4.0, 7, "background", ["siren", "knock"])
+        rows = self.build_rows({"music": 200, "speech": 200})
+        first, _ = manifest.cap_class_windows(rows, {"music": 50, "speech": 50}, 7)
+        second, _ = manifest.cap_class_windows(rows, {"music": 50, "speech": 50}, 7)
         self.assertEqual([row["path"] for row in first], [row["path"] for row in second])
 
-    def test_no_subsample_when_background_is_small(self):
-        rows = self.build_rows(target_per_class=10, background_per_split={"train": 20, "val": 5, "test": 5})
-        kept, stats = manifest.subsample_background(rows, 4.0, 42, "background", ["siren", "knock"])
-        self.assertEqual(stats["background_kept"], 30)
+    def test_no_cap_when_class_is_small(self):
+        rows = self.build_rows({"siren": 20})
+        kept, stats = manifest.cap_class_windows(rows, {"siren": 80}, 42)
         self.assertEqual(len(kept), len(rows))
-
-    def test_without_targets_nothing_is_dropped(self):
-        rows = [make_row("data/processed/background/a.wav", "background", "train", "a")]
-        kept, _ = manifest.subsample_background(rows, 4.0, 42, "background", [])
-        self.assertEqual(len(kept), 1)
+        self.assertEqual(stats["siren"]["kept"], 20)
 
 
 if __name__ == "__main__":

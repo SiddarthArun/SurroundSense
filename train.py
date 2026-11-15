@@ -2,11 +2,15 @@
 """Stage 3: train the DS-CNN using only manifest.csv + config.yaml.
 
 * classes come from the manifest/config (never hardcoded)
+* every class is capped to ``prepare.max_windows_per_class`` windows per split,
+  and background to ``prepare.background_ratio`` x the average class, so speech
+  and music cannot outvote a siren
 * microfrontend features are cached to data/features and reused across runs
 * training windows are expanded once with background-noise mixing, gain and
   time-shift augmentation, and streamed from disk in small batches
-* reports per-class precision/recall, a confusion matrix PNG, accuracy and the
-  false-positive rate on background test windows
+* reports per-class precision/recall/F1, a confusion matrix PNG, macro F1, the
+  background false-positive rate, the false alerts per hour that implies, and
+  what each candidate DETECT_THRESHOLD would do on the test split
 """
 
 from __future__ import annotations
@@ -29,6 +33,8 @@ from yamdetector.config import (  # noqa: E402
     set_seed,
 )
 from yamdetector.model import build_model, describe  # noqa: E402
+
+THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.90)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -83,8 +89,13 @@ def load_manifest_rows(cfg: dict) -> list[dict]:
     if not rows:
         raise SystemExit(
             f"error: {manifest_path} is missing or empty.\n"
-            "Run stage 1 first:  python scripts/prepare_esc50.py"
+            "Run the prep stages first:  python scripts/prepare_esc50.py "
+            "&& python scripts/prepare_datasets.py"
         )
+    try:
+        manifest.assert_unique_paths(rows)
+    except manifest.ManifestError as exc:
+        raise SystemExit(f"error: {exc}\nRe-run the prep stages to rebuild the manifest.") from exc
     missing = [row["path"] for row in rows if not features.resolve_row_path(row).exists()]
     if missing:
         preview = "\n  ".join(missing[:5])
@@ -101,7 +112,7 @@ def split_rows(rows: list[dict]) -> dict[str, list[dict]]:
         if not split_rows_:
             raise SystemExit(
                 f"error: the '{name}' split has no windows.\n"
-                "Check 'splits.esc50_folds' / 'splits.own_ratios' and re-run the preparation scripts."
+                "Check 'splits.esc50_folds' / 'splits.*_ratios' and re-run the prep stages."
             )
     return splits
 
@@ -111,10 +122,10 @@ def compute_class_weights(
 ) -> np.ndarray:
     """Square-root inverse-frequency weights, capped and normalized to mean 1.
 
-    Full inverse frequency is too aggressive here: the background class is ~5x
-    larger than the smallest target class, and flattening that completely makes
-    the model fire on ambient noise (high false-positive rate). The square root
-    halves the correction while still lifting the rare classes.
+    Full inverse frequency is too aggressive: background is deliberately ~3x the
+    size of a target class and flattening that completely makes the model fire on
+    ambient noise. The square root halves the correction while still lifting the
+    rare classes (siren has 30x less material than speech).
     """
     total = sum(label_counts.values())
     if total == 0:
@@ -127,8 +138,9 @@ def compute_class_weights(
     return (weights / weights.mean()).astype(np.float32)
 
 
-def make_dataset(tf, items, input_shape, weights_by_label, cfg, training: bool):
-    """Stream ``(feature, label, sample_weight)`` from cached .npy files."""
+def make_dataset(tf, items, cfg, weights_by_label, num_classes: int, training: bool):
+    """Stream ``(feature, one_hot_label, sample_weight)`` from cached .npy files."""
+    input_shape = tuple(cfg["features"]["input_shape"])
     paths = tf.constant([str(path) for path, _ in items])
     labels = tf.constant(np.asarray([label for _, label in items], dtype=np.int32))
     dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
@@ -143,8 +155,9 @@ def make_dataset(tf, items, input_shape, weights_by_label, cfg, training: bool):
         feature = tf.numpy_function(
             lambda item: np.load(item.decode("utf-8"), allow_pickle=False), [path], tf.float32
         )
-        feature.set_shape(tuple(input_shape))
-        return feature, label, tf.gather(weights_tensor, label)
+        feature.set_shape(input_shape)
+        one_hot = tf.one_hot(label, num_classes)
+        return feature, one_hot, tf.gather(weights_tensor, label)
 
     dataset = dataset.map(_load, num_parallel_calls=int(cfg["training"]["num_parallel_loads"]))
     batch_size = int(cfg["training"]["batch_size"])
@@ -184,7 +197,7 @@ def build_training_items(cfg, rows, label_index, force: bool) -> list[tuple[Path
                 )
             items.append((out_path, label_index[row["class"]]))
             done += 1
-            if done % 500 == 0 or done == total:
+            if done % 1000 == 0 or done == total:
                 print(f"  augmented windows {done}/{total}")
     return items
 
@@ -196,10 +209,54 @@ def evaluate(model, x_test, y_test, labels: list[str], background_index: int):
     overall = metrics.accuracy(matrix)
     per_class = metrics.per_class_metrics(matrix, labels)
     fpr = metrics.false_positive_rate_background(matrix, background_index)
-    return matrix, overall, per_class, fpr
+    return probabilities, matrix, overall, per_class, fpr
 
 
-def print_report(matrix, overall, per_class, fpr, labels, background_index) -> None:
+def threshold_report(
+    probabilities: np.ndarray,
+    y_test: np.ndarray,
+    labels: list[str],
+    background_index: int,
+    alert_indices: set[int],
+    windows_per_hour: float,
+) -> None:
+    """What each DETECT_THRESHOLD would cost on the test split.
+
+    The device fires when argmax is an alert class and its probability reaches
+    the threshold, so both numbers below use exactly that rule. A false alert
+    every 10 minutes is already unusable on a wearable (and the band buzzes).
+    """
+    predicted = np.argmax(probabilities, axis=1)
+    confidence = np.max(probabilities, axis=1)
+    background_mask = y_test == background_index
+    alert_mask_true = np.isin(y_test, sorted(alert_indices))
+
+    print("\nthreshold sweep on the test split (device rule: argmax is an alert class and p >= t):")
+    print(f"  {'t':>5}{'false alerts/h':>17}{'alert recall':>14}")
+    for threshold in THRESHOLDS:
+        fired = (predicted != background_index) & (confidence >= threshold)
+        false_rate = (
+            float(fired[background_mask].mean()) * windows_per_hour
+            if background_mask.any()
+            else float("nan")
+        )
+        recall = (
+            float(fired[alert_mask_true].mean()) if alert_mask_true.any() else float("nan")
+        )
+        print(f"  {threshold:>5.2f}{false_rate:>17.2f}{recall:>14.3f}")
+    del labels
+
+
+def print_report(
+    matrix,
+    overall,
+    per_class,
+    fpr,
+    labels,
+    background_index,
+    alert_labels: set[str],
+    windows_per_hour: float,
+) -> None:
     print("\nper-class metrics (test split):")
     print(f"  {'class':<18}{'precision':>10}{'recall':>9}{'f1':>8}{'support':>9}")
     for entry in per_class:
@@ -208,28 +265,37 @@ def print_report(matrix, overall, per_class, fpr, labels, background_index) -> N
             f"{entry['f1']:>8.3f}{entry['support']:>9}"
         )
 
+    scored = [entry for entry in per_class if entry["support"] > 0]
+    macro_f1 = float(np.mean([entry["f1"] for entry in scored])) if scored else 0.0
+    alert_f1 = [entry["f1"] for entry in scored if entry["label"] in alert_labels]
+    print(f"\nmacro F1: {macro_f1:.4f} over {len(scored)} classes")
+    if alert_f1:
+        print(f"macro F1 (alert classes only): {float(np.mean(alert_f1)):.4f}")
+
     print("\nconfusion matrix (rows = true, columns = predicted):")
-    header = "".join(f"{label[:9]:>10}" for label in labels)
+    header = "".join(f"{label[:8]:>9}" for label in labels)
     print(f"  {'':<16}{header}")
     for index, label in enumerate(labels):
-        row = "".join(f"{int(value):>10}" for value in matrix[index])
+        row = "".join(f"{int(value):>9}" for value in matrix[index])
         print(f"  {label[:15]:<16}{row}")
 
     print(f"\noverall accuracy: {overall:.4f}")
     if background_index is None:
         print("background false-positive rate: n/a (no background class in the manifest)")
-    else:
-        background_total = int(matrix[background_index, :].sum())
-        false_positives = background_total - int(matrix[background_index, background_index])
-        if background_total:
-            print(
-                f"background false-positive rate: {fpr:.4f} "
-                f"({false_positives}/{background_total} background windows predicted as a target class)"
-            )
-        else:
-            print(
-                "background false-positive rate: n/a (no background windows in the test split)"
-            )
+        return
+    background_total = int(matrix[background_index, :].sum())
+    false_positives = background_total - int(matrix[background_index, background_index])
+    if not background_total:
+        print("background false-positive rate: n/a (no background windows in the test split)")
+        return
+    print(
+        f"background false-positive rate: {fpr:.4f} "
+        f"({false_positives}/{background_total} background windows predicted as a target class)"
+    )
+    print(
+        f"  at a 0.5 s hop that is ~{fpr * windows_per_hour:.1f} false alerts per hour "
+        "(before the probability threshold)"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -257,40 +323,64 @@ def main(argv: list[str] | None = None) -> int:
     set_seed(int(cfg["training"]["seed"]), tensorflow=True)
 
     rows = load_manifest_rows(cfg)
+    background = cfg["classes"]["background"]
+    budgets = manifest.class_budgets(
+        rows,
+        background_label=background,
+        background_ratio=float(cfg["prepare"]["background_ratio"]),
+        max_per_class=int(cfg["prepare"]["max_windows_per_class"]),
+        max_background=int(cfg["prepare"]["max_background_windows"]),
+    )
+    selected, selection_stats = manifest.cap_class_windows(
+        rows, budgets, int(cfg["splits"]["seed"])
+    )
+
     labels = label_order(cfg, [row["class"] for row in rows])
     if len(labels) < 2:
         print(
             f"error: only {len(labels)} class(es) in the manifest ({labels}); "
-            "training needs at least 2 - run scripts/prepare_esc50.py first",
+            "training needs at least 2 - run the prep stages first",
             file=sys.stderr,
         )
         return 2
     label_index = {label: index for index, label in enumerate(labels)}
-    background = cfg["classes"]["background"]
     background_index = label_index.get(background)
+    alert_labels = set(cfg["classes"]["alert"])
+    alert_indices = {label_index[label] for label in alert_labels if label in label_index}
 
-    splits = split_rows(rows)
+    splits = split_rows(selected)
     train_classes = {row["class"] for row in splits["train"]}
     absent = [label for label in labels if label not in train_classes]
     if absent:
         print(
             f"error: class(es) {absent} have no windows in the train split; "
-            "check splits.esc50_folds / splits.own_ratios",
+            "check the split settings and re-run the prep stages",
             file=sys.stderr,
         )
         return 2
 
     print(f"classes ({len(labels)}): {', '.join(labels)}")
+    print(
+        f"windows per split: "
+        + ", ".join(f"{name}={len(splits[name])}" for name in manifest.SPLIT_NAMES)
+        + f"  (kept {len(selected)} of {len(rows)} manifest rows by the per-class caps)"
+    )
+    print(f"  {'class':<18}{'manifest':>10}{'kept':>7}{'budget':>8}")
+    for label in labels:
+        stats = selection_stats.get(label, {"available": 0, "kept": 0, "budget": 0})
+        print(
+            f"  {label:<18}{stats['available']:>10}{stats['kept']:>7}{stats['budget']:>8}"
+        )
     for name in manifest.SPLIT_NAMES:
         counts = Counter(row["class"] for row in splits[name])
         detail = ", ".join(f"{label}={counts.get(label, 0)}" for label in labels)
-        print(f"  {name:<5} {len(splits[name]):>5} windows  ({detail})")
+        print(f"  {name:<5} {len(splits[name]):>6} windows  ({detail})")
 
     # --- features ----------------------------------------------------------
     print("\ncomputing/caching microfrontend features ...")
     jobs = [
         (features.resolve_row_path(row), features.cache_path(cfg, features.resolve_row_path(row)))
-        for row in rows
+        for row in selected
     ]
     computed = features.compute_missing(cfg, jobs, force=args.force_features)
     print(
@@ -302,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
     x_test = features.load_split_features(cfg, splits["test"])
     y_val = np.asarray([label_index[row["class"]] for row in splits["val"]], dtype=np.int32)
     y_test = np.asarray([label_index[row["class"]] for row in splits["test"]], dtype=np.int32)
+    y_val_one_hot = np.eye(len(labels), dtype=np.float32)[y_val]
     print(f"  val {x_val.shape}, test {x_test.shape}")
 
     # --- training data -----------------------------------------------------
@@ -317,19 +408,25 @@ def main(argv: list[str] | None = None) -> int:
         + ", ".join(f"{labels[i]}={class_weights[i]:.2f}" for i in range(len(labels)))
     )
 
-    train_ds = make_dataset(tf, train_items, cfg["features"]["input_shape"], class_weights, cfg, True)
+    train_ds = make_dataset(tf, train_items, cfg, class_weights, len(labels), True)
     val_weights = np.ones(len(y_val), dtype=np.float32)
 
     # --- model -------------------------------------------------------------
     model = build_model(cfg, len(labels))
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=float(cfg["training"]["learning_rate"])),
-        loss="sparse_categorical_crossentropy",
+        loss=tf.keras.losses.CategoricalCrossentropy(
+            label_smoothing=float(cfg["training"]["label_smoothing"])
+        ),
         metrics=["accuracy"],
     )
-    print(f"\nmodel: {describe(model)} (budget 80,000), input {cfg['features']['input_shape']}")
-    if model.count_params() > 80_000:
-        print("warning: parameter count exceeds the 80k budget for the MCU target", file=sys.stderr)
+    budget = int(cfg["training"]["param_budget"])
+    print(f"\nmodel: {describe(model)} (budget {budget:,}), input {cfg['features']['input_shape']}")
+    if model.count_params() > budget:
+        print(
+            f"warning: parameter count exceeds the {budget:,} budget for the MCU target",
+            file=sys.stderr,
+        )
 
     output_dir = Path(cfg["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -342,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
             restore_best_weights=True,
             verbose=1,
         ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=6, min_lr=1e-5, verbose=1
+        ),
         tf.keras.callbacks.ModelCheckpoint(
             filepath=str(best_model_path), monitor="val_loss", save_best_only=True, verbose=0
         ),
@@ -350,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\ntraining up to {cfg['training']['epochs']} epochs, batch {cfg['training']['batch_size']}")
     history = model.fit(
         train_ds,
-        validation_data=(x_val, y_val, val_weights),
+        validation_data=(x_val, y_val_one_hot, val_weights),
         epochs=int(cfg["training"]["epochs"]),
         callbacks=callbacks,
         verbose=2,
@@ -364,10 +464,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"saved Keras model: {best_model_path}")
 
     # --- evaluation --------------------------------------------------------
-    matrix, overall, per_class, fpr = evaluate(
+    probabilities, matrix, overall, per_class, fpr = evaluate(
         model, x_test, y_test, labels, background_index if background_index is not None else 0
     )
-    print_report(matrix, overall, per_class, fpr, labels, background_index)
+    windows_per_hour = float(cfg["training"]["windows_per_hour"])
+    print_report(
+        matrix, overall, per_class, fpr, labels, background_index, alert_labels, windows_per_hour
+    )
+    threshold_report(
+        probabilities, y_test, labels,
+        background_index if background_index is not None else 0,
+        alert_indices, windows_per_hour,
+    )
+
+    own_rows = [row for row in splits["test"] if row["source"] == cfg["prepare"]["own_source"]]
+    if own_rows:
+        own_index = [index for index, row in enumerate(splits["test"]) if row["source"] == cfg["prepare"]["own_source"]]
+        own_accuracy = float(np.mean(np.argmax(probabilities[own_index], axis=1) == y_test[own_index]))
+        print(f"\naccuracy on our own device recordings ({len(own_rows)} test windows): {own_accuracy:.4f}")
 
     confusion_path = metrics.plot_confusion_matrix(
         matrix, labels, output_dir / "confusion_matrix.png"

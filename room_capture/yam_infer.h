@@ -25,7 +25,7 @@
 
 constexpr int    WIN_SAMPLES = AUDIO_SAMPLE_RATE;   // 1 s window (audio.window_seconds)
 constexpr int    HOP_BLOCKS  = 31;                  // 31 x 16 ms = ~0.5 s between windows
-constexpr size_t ARENA_BYTES = 160 * 1024;          // trim using the "arena used" startup line
+constexpr size_t ARENA_BYTES = 512 * 1024;          // trim using the "arena used" startup line
 
 // Training contract, from config.yaml. Change them together with the model.
 constexpr float kPeakTarget = 0.95f;    // audio.peak_target
@@ -212,7 +212,9 @@ bool inferRun() {
   Serial.printf("| gain %4.1f | %lu ms\n", gain, (unsigned long)(now - t0));
 #endif
 
-  const bool isEvent = best != CLS_BACKGROUND && prob[best] >= DETECT_THRESHOLD &&
+  // CLASS_ALERT comes from protocol.h (classes.alert in config.yaml): speech, music
+  // and background classify fine but never buzz the band.
+  const bool isEvent = CLASS_ALERT[best] && prob[best] >= DETECT_THRESHOLD &&
                        (lastEventMs[best] == 0 || now - lastEventMs[best] >= COOLDOWN_MS);
 
   // Direction from all four mics over this same window (ring still holds exactly it).

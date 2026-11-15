@@ -150,64 +150,144 @@ def assign_splits_by_file(
     return assignment
 
 
-def subsample_background(
-    rows: Sequence[dict],
-    ratio: float,
-    seed: int,
+def class_for_labels(
+    labels: Sequence[str],
+    label_map: dict[str, str],
+    order: Sequence[str],
     background_label: str,
-    target_labels: Sequence[str],
-) -> tuple[list[dict], dict]:
-    """Cap background windows at ``ratio`` x the average target-class size.
+) -> str:
+    """Pick one class for a multi-label clip.
 
-    Selection happens per split, in proportion to how many background windows
-    each split already holds, so the fold-based split ratio is preserved.
+    FSD50K clips carry several labels (a scream is also ``Human_voice`` and
+    often ``Speech``). ``order`` decides the winner, so the alert classes listed
+    first in ``classes.order`` beat the broad ``speech``/``music`` labels.
+    """
+    hits = {label_map[label] for label in labels if label in label_map}
+    if not hits:
+        return background_label
+    for label in order:
+        if label in hits:
+            return label
+    return sorted(hits)[0]
+
+
+def assert_unique_paths(rows: Sequence[dict]) -> None:
+    """Every window file is one row in one split, and no recording leaks.
+
+    A window appearing twice (possibly in two splits) silently inflates the
+    results: the same audio is trained on and tested on. Splits are assigned per
+    source recording, so every window of one recording must share a split too.
+    """
+    seen: dict[str, str] = {}
+    for row in rows:
+        path, split = row["path"], row["split"]
+        if path in seen:
+            detail = (
+                f"in both '{seen[path]}' and '{split}' (train/test leakage)"
+                if seen[path] != split
+                else "more than once"
+            )
+            raise ManifestError(f"{path} appears {detail}")
+        seen[path] = split
+
+    file_splits: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in rows:
+        file_splits[(row.get("source", ""), row.get("source_file_id", ""))].add(row["split"])
+    leaked = sorted(key for key, splits in file_splits.items() if len(splits) > 1)
+    if leaked:
+        source, file_id = leaked[0]
+        raise ManifestError(
+            f"recording '{file_id}' (source '{source}') has windows in more than one split "
+            f"({', '.join(sorted(file_splits[leaked[0]]))}); splits must follow the "
+            "source recording, never the window"
+        )
+
+
+def class_budgets(
+    rows: Sequence[dict],
+    background_label: str,
+    background_ratio: float,
+    max_per_class: int,
+    max_background: int | None = None,
+) -> dict[str, int]:
+    """Windows to keep per class: a flat cap, with background scaled by ratio.
+
+    Background gets its own, larger cap (``max_background``): it is the class the
+    wearable cares about most, because every background window the model calls a
+    target is a false buzz. Capping it with the same flat number as the targets
+    is what made the first 13-class run fire on 61% of ordinary room sound.
+    """
+    counts = Counter(row["class"] for row in rows)
+    budgets = {label: int(max_per_class) for label in counts}
+    targets = [count for label, count in counts.items() if label != background_label]
+    if targets:
+        average = sum(targets) / len(targets)
+        ceiling = int(max_background) if max_background else int(max_per_class)
+        budgets[background_label] = max(
+            1, min(ceiling, int(round(background_ratio * average)))
+        )
+    return budgets
+
+
+def cap_class_windows(
+    rows: Sequence[dict], budgets: dict[str, int], seed: int
+) -> tuple[list[dict], dict]:
+    """Keep at most ``budgets[class]`` windows per class, spread over the splits.
+
+    Deterministic for a given ``(rows, budgets, seed)``: the same windows come
+    back on every run, so train.py and export.py see the same test set. Each
+    split keeps its share, so the fold-based split ratio survives the cap.
     Returns ``(kept_rows, stats)``.
     """
-    background_rows = [row for row in rows if row["class"] == background_label]
-    target_rows = [row for row in rows if row["class"] in set(target_labels)]
-    if not background_rows:
-        return list(rows), {"background_kept": 0, "background_available": 0, "budget": 0}
+    stats: dict[str, dict] = {}
+    kept: list[dict] = []
 
-    per_class = Counter(row["class"] for row in target_rows)
-    if not per_class:
-        return list(rows), {
-            "background_kept": len(background_rows),
-            "background_available": len(background_rows),
-            "budget": len(background_rows),
-        }
-    average_target = sum(per_class.values()) / len(per_class)
-    budget = int(round(ratio * average_target))
-    if budget >= len(background_rows):
-        return list(rows), {
-            "background_kept": len(background_rows),
-            "background_available": len(background_rows),
+    for label in sorted({row["class"] for row in rows}):
+        label_rows = sorted(
+            (row for row in rows if row["class"] == label), key=lambda row: row["path"]
+        )
+        budget = int(budgets.get(label, len(label_rows)))
+        if budget >= len(label_rows) or budget <= 0:
+            kept.extend(label_rows if budget > 0 else [])
+            stats[label] = {
+                "available": len(label_rows),
+                "kept": len(label_rows) if budget > 0 else 0,
+                "budget": max(budget, 0),
+            }
+            continue
+
+        by_split: dict[str, list[dict]] = defaultdict(list)
+        for row in label_rows:
+            by_split[row["split"]].append(row)
+        total_available = len(label_rows)
+        # A stable per-class stream: adding a class never reshuffles another one.
+        rng = np.random.default_rng([int(seed), len(label), sum(map(ord, label))])
+
+        chosen: dict[str, list[dict]] = {}
+        for split in SPLIT_NAMES:
+            available = by_split.get(split, [])
+            if not available:
+                continue
+            share = int(round(budget * len(available) / total_available))
+            share = min(max(share, 1), len(available))
+            indices = np.sort(rng.permutation(len(available))[:share])
+            chosen[split] = [available[int(index)] for index in indices]
+
+        kept_count = sum(len(entries) for entries in chosen.values())
+        while kept_count > budget:  # rounding overshoot: trim the biggest split
+            split = max(chosen, key=lambda name: len(chosen[name]))
+            if len(chosen[split]) <= 1:
+                break
+            chosen[split].pop()
+            kept_count -= 1
+
+        for split in SPLIT_NAMES:
+            kept.extend(chosen.get(split, []))
+        stats[label] = {
+            "available": total_available,
+            "kept": sum(len(entries) for entries in chosen.values()),
             "budget": budget,
         }
 
-    by_split: dict[str, list[dict]] = defaultdict(list)
-    for row in background_rows:
-        by_split[row["split"]].append(row)
-    total_available = len(background_rows)
-
-    rng = np.random.default_rng(seed)
-    kept: list[dict] = []
-    for split in SPLIT_NAMES:
-        available = sorted(by_split.get(split, []), key=lambda row: row["path"])
-        if not available:
-            continue
-        share = int(round(budget * len(available) / total_available))
-        share = min(max(share, 1), len(available))
-        indices = rng.permutation(len(available))[:share]
-        kept.extend(available[int(index)] for index in sorted(indices))
-
-    kept_paths = {row["path"] for row in kept}
-    remaining = [
-        row
-        for row in rows
-        if row["class"] != background_label or row["path"] in kept_paths
-    ]
-    return remaining, {
-        "background_kept": len(kept),
-        "background_available": total_available,
-        "budget": budget,
-    }
+    kept.sort(key=lambda row: row["path"])
+    return kept, stats

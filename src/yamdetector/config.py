@@ -28,6 +28,9 @@ _ESC50_CANDIDATES = (
 _PATH_KEYS = (
     "esc50_audio_dir",
     "esc50_meta_csv",
+    "fsd50k_audio_dir",
+    "fsd50k_ground_truth_dir",
+    "ravdess_audio_dir",
     "raw_recordings_dir",
     "processed_dir",
     "manifest_csv",
@@ -129,21 +132,47 @@ def load_config(path: str | Path | None = None) -> dict:
     background = _get(classes, "background", "classes.")
     if not isinstance(background, str) or not background:
         raise ConfigError("config.yaml: 'classes.background' must be a class name")
-    esc50_map = _get(classes, "esc50_map", "classes.")
-    if not isinstance(esc50_map, dict):
-        raise ConfigError("config.yaml: 'classes.esc50_map' must map ESC-50 category -> label")
-    for source_category, label in esc50_map.items():
-        if not isinstance(label, str) or not label:
+    for key in ("esc50_map", "fsd50k_map"):
+        label_map = _get(classes, key, "classes.")
+        if not isinstance(label_map, dict):
             raise ConfigError(
-                f"config.yaml: 'classes.esc50_map.{source_category}' must map to a class name"
+                f"config.yaml: 'classes.{key}' must map a source category to a class"
             )
+        for source_category, label in label_map.items():
+            if not isinstance(label, str) or not label:
+                raise ConfigError(
+                    f"config.yaml: 'classes.{key}.{source_category}' must map to a class name"
+                )
+        classes[key] = {str(k): str(v) for k, v in label_map.items()}
+
+    ravdess_label = _get(classes, "ravdess_label", "classes.")
+    if not isinstance(ravdess_label, str) or not ravdess_label.strip():
+        raise ConfigError("config.yaml: 'classes.ravdess_label' must be a class name")
+    classes["ravdess_label"] = ravdess_label.strip()
+
     order = classes.get("order") or []
     if not isinstance(order, list) or not all(isinstance(item, str) and item for item in order):
         raise ConfigError("config.yaml: 'classes.order' must be a list of class names")
     background = background.strip()
     classes["background"] = background
-    classes["esc50_map"] = {str(k): str(v) for k, v in esc50_map.items()}
     classes["order"] = [item.strip() for item in order]
+    if background not in classes["order"]:
+        raise ConfigError(
+            "config.yaml: 'classes.background' must also be listed in 'classes.order' "
+            "(the model needs an output index for it)"
+        )
+
+    alert = classes.get("alert")
+    if not isinstance(alert, list) or not all(isinstance(item, str) and item for item in alert):
+        raise ConfigError("config.yaml: 'classes.alert' must be a list of class names")
+    missing = [item for item in alert if item.strip() not in classes["order"]]
+    if missing:
+        raise ConfigError(
+            f"config.yaml: 'classes.alert' lists {missing}, which are not in 'classes.order'"
+        )
+    if background in {item.strip() for item in alert}:
+        raise ConfigError("config.yaml: 'classes.alert' must not contain the background class")
+    classes["alert"] = [item.strip() for item in alert]
 
     # --- features ----------------------------------------------------------
     features = _get_section(cfg, "features")
@@ -216,30 +245,42 @@ def load_config(path: str | Path | None = None) -> dict:
             normalized_folds[split].append(fold)
     splits["esc50_folds"] = normalized_folds
 
-    ratios = _get(splits, "own_ratios", "splits.")
-    if not isinstance(ratios, dict):
-        raise ConfigError("config.yaml: 'splits.own_ratios' must be a mapping of split -> ratio")
-    own_ratios: dict[str, float] = {}
-    for split in SPLIT_NAMES:
-        value = _get(ratios, split, "splits.own_ratios.")
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+    for key in ("fsd50k_ratios", "ravdess_ratios", "own_ratios"):
+        ratios = _get(splits, key, "splits.")
+        if not isinstance(ratios, dict):
+            raise ConfigError(f"config.yaml: 'splits.{key}' must be a mapping of split -> ratio")
+        normalized: dict[str, float] = {}
+        for split in SPLIT_NAMES:
+            value = _get(ratios, split, f"splits.{key}.")
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                raise ConfigError(
+                    f"config.yaml: 'splits.{key}.{split}' must be a non-negative number"
+                )
+            normalized[split] = float(value)
+        if abs(sum(normalized.values()) - 1.0) > 1e-6:
             raise ConfigError(
-                f"config.yaml: 'splits.own_ratios.{split}' must be a non-negative number"
+                f"config.yaml: 'splits.{key}' must sum to 1.0, got "
+                f"{sum(normalized.values()):.3f}"
             )
-        own_ratios[split] = float(value)
-    if abs(sum(own_ratios.values()) - 1.0) > 1e-6:
-        raise ConfigError(
-            "config.yaml: 'splits.own_ratios' must sum to 1.0, got "
-            f"{sum(own_ratios.values()):.3f}"
-        )
-    splits["own_ratios"] = own_ratios
+        splits[key] = normalized
     splits["seed"] = int(splits.get("seed", 42))
 
     # --- prepare -----------------------------------------------------------
     prepare = _get_section(cfg, "prepare")
     ratio = _positive_number(prepare, "background_ratio", "prepare.")
     prepare["background_ratio"] = ratio
+    for key, default in (
+        ("max_windows_per_class", 2000),
+        ("max_background_windows", 6000),
+        ("max_windows_per_clip", 5),
+    ):
+        value = prepare.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError(f"config.yaml: 'prepare.{key}' must be a positive integer")
+        prepare[key] = value
     prepare["esc50_source"] = str(prepare.get("esc50_source", "esc50"))
+    prepare["fsd50k_source"] = str(prepare.get("fsd50k_source", "fsd50k"))
+    prepare["ravdess_source"] = str(prepare.get("ravdess_source", "ravdess"))
     prepare["own_source"] = str(prepare.get("own_source", "own"))
 
     # --- training ----------------------------------------------------------
@@ -254,6 +295,9 @@ def load_config(path: str | Path | None = None) -> dict:
     training.setdefault("shuffle_buffer", 1024)
     training.setdefault("num_parallel_loads", 2)
     training.setdefault("max_class_weight", 10.0)
+    training.setdefault("label_smoothing", 0.0)
+    training.setdefault("param_budget", 120_000)
+    training.setdefault("windows_per_hour", 7200)
     if int(training["batch_size"]) < 1:
         raise ConfigError("config.yaml: 'training.batch_size' must be >= 1")
     if int(training["epochs"]) < 1:

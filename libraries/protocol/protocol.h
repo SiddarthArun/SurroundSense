@@ -25,17 +25,33 @@ enum : uint8_t { MSG_ALERT = 1, MSG_HEARTBEAT = 2, MSG_ACK = 3, MSG_TEST = 4 };
 // Sound classes. MUST match classes.order in config.yaml (= artifacts/labels.txt):
 // the room unit sends the model's output index as class_id, and the wristband looks
 // the name up here. When a class is added to config.yaml, add it here in the same
-// position too; export.py warns if CLASS_NAMES and labels.txt differ.
+// position too; export.py warns if CLASS_NAMES or CLASS_ALERT differ.
 enum : uint8_t {
   CLS_SIREN        = 0,
   CLS_CAR_HORN     = 1,
   CLS_ALARM        = 2,
   CLS_KNOCK        = 3,
-  CLS_BACKGROUND   = 4,
-  CLS_COUNT        = 5,
-  CLS_CUSTOM_FIRST = 8,   // 8-15 = teach-a-sound custom classes (laptop)
+  CLS_GLASS        = 4,
+  CLS_SCREAM       = 5,
+  CLS_BABY_CRY     = 6,
+  CLS_DOG_BARK     = 7,
+  CLS_GUNSHOT      = 8,
+  CLS_THUNDER      = 9,
+  CLS_SPEECH       = 10,
+  CLS_MUSIC        = 11,
+  CLS_BACKGROUND   = 12,
+  CLS_COUNT        = 13,
+  CLS_CUSTOM_FIRST = 16,   // 16-31 = teach-a-sound custom classes (laptop)
 };
-static const char *const CLASS_NAMES[CLS_COUNT] = {"siren", "car_horn", "alarm", "knock", "background"};
+static const char *const CLASS_NAMES[CLS_COUNT] = {
+    "siren", "car_horn", "alarm", "knock", "glass", "scream",
+    "baby_cry", "dog_bark", "gunshot", "thunder", "speech", "music", "background"};
+
+// true = this class buzzes the wristband (classes.alert in config.yaml). speech,
+// music and background exist so the softmax can explain ordinary room sound
+// instead of forcing it onto an urgent class; they never fire an event.
+static const bool CLASS_ALERT[CLS_COUNT] = {
+    true, true, true, true, true, true, true, true, true, true, false, false, false};
 
 // Where a sound came from, relative to the wearer (chest = front). The room unit's doa.h sends
 // FRONT / RIGHT / BEHIND / LEFT, or all eight with DOA_SECTORS 8.

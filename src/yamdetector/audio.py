@@ -173,6 +173,23 @@ def slice_windows(
     return np.stack(frames).astype(np.float32, copy=False)
 
 
+def limit_windows(windows: np.ndarray, cap: int) -> np.ndarray:
+    """Keep at most ``cap`` windows, spread evenly over the recording.
+
+    A 30 s FSD50K clip is not 30 independent examples, and the event is often
+    not in the first second, so windows are sampled across the whole clip
+    instead of taking the first ``cap``.
+    """
+    cap = int(cap)
+    if cap <= 0:
+        raise AudioError(f"window cap must be > 0, got {cap}")
+    windows = np.asarray(windows, dtype=np.float32)
+    if len(windows) <= cap:
+        return windows
+    indices = np.linspace(0, len(windows) - 1, cap).round().astype(int)
+    return windows[np.unique(indices)]
+
+
 def load_clip(
     path: str | Path,
     target_rate: int,

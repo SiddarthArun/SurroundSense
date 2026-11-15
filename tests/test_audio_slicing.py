@@ -60,6 +60,23 @@ class SliceWindowsTests(unittest.TestCase):
         self.assertEqual(windows.shape, (1, 16000))
 
 
+class LimitWindowsTests(unittest.TestCase):
+    def test_short_recording_keeps_every_window(self):
+        windows = np.arange(3 * 4, dtype=np.float32).reshape(3, 4)
+        self.assertEqual(audio.limit_windows(windows, 5).shape, (3, 4))
+
+    def test_cap_samples_across_the_recording(self):
+        windows = np.arange(30 * 4, dtype=np.float32).reshape(30, 4)
+        kept = audio.limit_windows(windows, 5)
+        self.assertEqual(kept.shape, (5, 4))
+        self.assertEqual(float(kept[0, 0]), 0.0)  # first window stays
+        self.assertEqual(float(kept[-1, 0]), 29 * 4)  # last window stays too
+
+    def test_cap_must_be_positive(self):
+        with self.assertRaises(audio.AudioError):
+            audio.limit_windows(np.zeros((4, 8), dtype=np.float32), 0)
+
+
 class LevelTests(unittest.TestCase):
     def test_rms_matches_known_value(self):
         self.assertAlmostEqual(audio.rms(np.full(100, 0.5, dtype=np.float32)), 0.5, places=6)

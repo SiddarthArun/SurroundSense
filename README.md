@@ -1,10 +1,16 @@
 # yamDetector
 
 Sound-awareness system. A wearable harness (Seeed XIAO ESP32S3 Sense with 4 PDM MEMS mics,
-two on the chest and two on the back) classifies **siren / car_horn / alarm / knock** on the
-device, stays quiet on everything else (**background**), and works out which side of the wearer
-the sound came from. An ESP-01 wristband with a vibration motor and an OLED receives those
-alerts over ESP-NOW: it buzzes and shows what the sound is and where it came from.
+two on the chest and two on the back) classifies urgent sound on the device and works out which
+side of the wearer it came from. An ESP-01 wristband with a vibration motor and an OLED receives
+those alerts over ESP-NOW: it buzzes and shows what the sound is and where it came from.
+
+Thirteen classes, in two tiers:
+
+| Tier | Classes | On the band |
+| --- | --- | --- |
+| **alert** | `siren`, `car_horn`, `alarm`, `knock`, `glass`, `scream`, `baby_cry`, `dog_bark`, `gunshot`, `thunder` | buzzes, names the sound and the direction |
+| **silent** | `speech`, `music`, `background` | nothing: they exist so the model can explain ordinary room sound instead of forcing it onto an urgent class |
 
 | Working | Not built yet |
 | --- | --- |
@@ -14,7 +20,7 @@ alerts over ESP-NOW: it buzzes and shows what the sound is and where it came fro
 | Direction: front / right / behind / left (section 4) | |
 | ESP-NOW alerts to the wristband: buzz + class + direction on the OLED | |
 
-The model is a small DS-CNN trained with TensorFlow/Keras on ESC-50 plus our own
+The model is a DS-CNN trained with TensorFlow/Keras on ESC-50, FSD50K, RAVDESS and our own
 recordings, exported to int8 TFLite Micro.
 
 ## Layout
@@ -31,11 +37,14 @@ libraries/microfrontend/ TensorFlow audio microfrontend C code (the on-device fe
 host/recorder.py         records the harness's stream into my_recordings_raw/<label>/
 
 config.yaml              every ML setting (classes, audio, features, splits, training)
-scripts/                 stage 1 prepare_esc50.py, stage 2 convert_recordings.py
+scripts/                 stage 1 prepare_esc50.py + prepare_datasets.py (FSD50K, RAVDESS),
+                         stage 2 convert_recordings.py
 train.py, export.py      stage 3 train, stage 4 export (TFLite, model.h, labels.txt)
 src/yamdetector/         shared Python library (audio, manifest, features, model, metrics)
-tests/                   unit tests for slicing and split logic
+tests/                   unit tests for slicing, splits, class caps and label mapping
 data/ESC-50/             the ESC-50 dataset (read-only, CC BY-NC: see data/ESC-50/LICENSE)
+data/FSD50K/             FSD50K audio + data/FSD50K.ground_truth/ (CC BY), read-only
+data/ravdess/            RAVDESS speech (CC BY-NC-SA), read-only
 ```
 
 Generated and gitignored: `data/processed/`, `data/features/`, `artifacts/`,
@@ -146,6 +155,7 @@ it picked and falls back to CPU.
 
 ```bash
 python scripts/prepare_esc50.py                 # ESC-50 -> data/processed (folds 1-3 train, 4 val, 5 test)
+python scripts/prepare_datasets.py              # FSD50K + RAVDESS (splits by clip / by actor)
 python scripts/convert_recordings.py            # optional: adds my_recordings_raw/<class>/*
 python train.py                                 # features are cached, reruns start fast
 python export.py --firmware-dir room_capture    # artifacts/ + room_capture/model.h
@@ -155,19 +165,22 @@ Useful options:
 
 ```bash
 python scripts/prepare_esc50.py --limit 50      # smoke test (splits will be incomplete)
+python scripts/prepare_datasets.py --limit-clips 50   # smoke test, one dataset or both
+python scripts/prepare_datasets.py --source ravdess   # rebuild just one extra source
 python scripts/convert_recordings.py --mix      # average all channels (default: channel 0)
 python scripts/convert_recordings.py --channel 1
 python train.py --epochs 10 --batch-size 8      # quick experiment
 python train.py --no-augment --force-features   # no augmentation, rebuild the feature cache
 ```
 
-Every stage can be re-run safely. Stage 1 replaces only ESC-50 rows, stage 2 replaces only
-its own rows, and stage 3 reuses cached features.
+Every stage can be re-run safely. Each prep script replaces only its own rows, and stage 3
+reuses cached features.
 
 **Class order matters.** The model's output index is the class id the firmware uses.
 `classes.order` in `config.yaml` must match `CLASS_NAMES` and the `CLS_` enum in
-`libraries/protocol/protocol.h`. `export.py` warns on a mismatch, and `yam_infer.h` refuses
-to compile if the class counts differ.
+`libraries/protocol/protocol.h`, and `classes.alert` must match `CLASS_ALERT` there.
+`export.py` warns on a mismatch, and `yam_infer.h` refuses to compile if the class counts
+differ.
 
 ## 4. Run the harness
 
@@ -197,27 +210,31 @@ arduino-cli compile --upload -p COM11 --fqbn esp32:esp32:XIAO_ESP32S3:CDCOnBoot=
 
 ```text
 [yamDetector] radio: ESP-NOW channel 1 (radio on 1), alerts broadcast
-[yamDetector] ready: model 44928 B, arena used 52112 of 163840 B (PSRAM), threshold 0.70
+[yamDetector] ready: model 142952 B, arena used 191744 of 524288 B (PSRAM), threshold 0.70
 [yamDetector] direction: on, 4 directions
-siren 0.01  car_horn 0.02  alarm 0.01  knock 0.03  background 0.93  | gain 10.0 | 38 ms
-siren 0.91  car_horn 0.04  alarm 0.03  knock 0.00  background 0.02  | gain  2.1 | 38 ms
+siren 0.01  car_horn 0.00  alarm 0.00  knock 0.02  glass 0.00  scream 0.00  baby_cry 0.00  dog_bark 0.01  gunshot 0.00  thunder 0.00  speech 0.01  music 0.02  background 0.93  | gain 10.0 | 96 ms
+siren 0.91  car_horn 0.02  alarm 0.01  knock 0.00  glass 0.00  scream 0.00  baby_cry 0.00  dog_bark 0.00  gunshot 0.00  thunder 0.00  speech 0.01  music 0.01  background 0.04  | gain  2.1 | 96 ms
 [yamDetector] dir behind   az 187 | front/behind -0.71 (time -0.62, level  -9.6 dB) | right/left -0.08 (time -0.10, level  -0.7 dB) | 6 ms
 [yamDetector] Event: SIREN | Conf: 91% | Dir: BEHIND | #1
 [yamDetector] wristband ACK seq 43, 18 ms
 ```
 
-(The numbers above are illustrative, not measured.)
+(Illustrative output. `model 142952 B` and `threshold 0.70` are the real values; the `arena used`
+and millisecond figures depend on the build and are printed at boot.)
 
 - One line per window: 1 s of audio, every 0.5 s. `gain` is the peak-normalization boost, and
   the last number is the processing time.
-- An **Event** line prints when the top class isn't background, its probability reaches
-  `DETECT_THRESHOLD`, and that class hasn't fired within `COOLDOWN_MS`. That same Event is the
-  alert the wristband buzzes on.
+- An **Event** line prints when the top class is an **alert-tier** class (`CLASS_ALERT`),
+  its probability reaches `DETECT_THRESHOLD`, and that class hasn't fired within `COOLDOWN_MS`.
+  That same Event is the alert the wristband buzzes on. `speech`, `music` and `background` are
+  printed but never fire, so a conversation or a TV in the room cannot buzz the band.
 - The **ACK** line is the band echoing the message number and its timestamp, so the last number
   is the round trip. No ACK line means the band is off, out of range, or on another channel.
 - These settings are at the top of `room_capture/yam_infer.h`. `PRINT_PROBS 0` leaves only
   the Event lines.
-- Quick test: play ESC-50 fold-5 clips (siren, car_horn, clock_alarm, door_wood_knock) from a speaker.
+- Quick test: play ESC-50 fold-5 clips (siren, car_horn, clock_alarm, glass_breaking, crying_baby,
+  dog, thunderstorm) from a speaker, and talk over it: the probabilities should move to `speech`
+  with no Event line.
 
 ### Direction
 
@@ -303,9 +320,10 @@ alone still carries the debug output at 115200.
 | `NO SIGNAL 14.2s` | nothing received for 12 s: harness off, or a channel mismatch |
 | `LOW BAT` after the voltage | supply below 2.9 V, change the AAs |
 
-- Anything but background is an alert. The band buzzes for `MOTOR_MS` (400 ms) and shows the
-  class name from `CLASS_NAMES`, so the label order rule from section 3 applies here too.
-  Custom class ids 8-15 from the laptop show as `CUSTOM n`.
+- Only alert-tier classes arrive as alerts (the harness never sends the silent ones), and the
+  band buzzes for `MOTOR_MS` (400 ms) showing the class name from `CLASS_NAMES`, so the label
+  order rule from section 3 applies here too. Custom class ids 16-31 from the laptop show as
+  `CUSTOM n`.
 - The band ACKs every message, alert or heartbeat, echoing `seq` and `t_ms`; that is what the
   harness's ACK line reports. It replies to the address the message came from, so neither
   sketch contains the other board's MAC.
@@ -321,31 +339,57 @@ alone still carries the debug output at 115200.
 ## How the pipeline works
 
 ```text
-data/ESC-50/       ── prepare_esc50.py ───────┐
-                                              ├──► data/processed/<class>/*.wav + manifest.csv
-my_recordings_raw/ ── convert_recordings.py ──┘                  │
-                                                                 ├──► train.py  -> artifacts/model.keras
-                                                                 └──► export.py -> model_int8.tflite, model.h, labels.txt
+data/ESC-50/       ── prepare_esc50.py ─────┐
+data/FSD50K/       ── prepare_datasets.py ──┤──► data/processed/<class>/*.wav + manifest.csv
+data/ravdess/                             ──┤                  │
+my_recordings_raw/ ── convert_recordings.py ┘                  ├──► train.py  -> artifacts/model.keras
+                                                               └──► export.py -> model_int8.tflite, model.h, labels.txt
 ```
 
+- **Sources.** ESC-50 supplies the original alert sounds, FSD50K ten real-world alert classes
+  plus speech and music, RAVDESS acted speech, and our own recordings the sound the device really
+  hears. `classes.esc50_map` / `classes.fsd50k_map` say which source category becomes which
+  class. FSD50K clips are multi-label: the class listed first in `classes.order` wins, so a
+  `Screaming` + `Speech` clip trains as `scream`. Anything unmapped becomes `background`,
+  which is where most of the room-noise variety comes from.
 - **Manifest.** `manifest.csv` (`path,class,source,source_file_id,split`) is the only thing
-  training reads, besides `config.yaml`. Splits are assigned per source recording, never per
-  window, so one recording can't leak across train/val/test.
+  training reads, besides `config.yaml`. Splits are assigned per source recording (ESC-50 fold,
+  FSD50K clip, RAVDESS actor), never per window, and training refuses to start if a window or a
+  recording shows up in two splits.
 - **Windows.** 16 kHz mono, 1 s, peak-normalized to 0.95 (max +20 dB). Near-silent windows
-  are skipped for target classes. Background is subsampled to 4x the average target class.
+  are skipped for target classes. Long clips contribute at most
+  `prepare.max_windows_per_clip` windows, spread over the whole clip.
+- **Balance.** Every class is capped at `prepare.max_windows_per_class` windows and background
+  at `prepare.background_ratio` x the average class, up to `prepare.max_background_windows`,
+  per split. Speech and music have roughly 30x the source material of a siren; without the cap
+  the softmax learns to answer "music". Background gets the larger ceiling because every
+  background window called a target is a false buzz on the band.
+  The caps are applied when the training set is built, so no files are deleted and the test
+  split is reproducible.
 - **Features.** TensorFlow `audio_microfrontend`: 40 channels, 30 ms window, 20 ms step,
   125-7500 Hz, log + PCAN, divided by 255. This gives `49 x 40 x 1` per window, cached under
   `data/features/` as one `.npy` each.
-- **Augmentation** (train split only): background noise at 0-20 dB SNR, gain of ±6 dB, and a
-  time shift of ±100 ms. Copies are generated once and cached.
-- **Model.** DS-CNN: a 3x3 conv stem and four depthwise-separable blocks (64 filters), then
-  global average pooling and softmax. About 21k parameters, with ReLU6 and BatchNorm for clean
-  int8 conversion.
-- **Training.** Adam, square-root inverse-frequency class weights, and early stopping on
-  `val_loss`. It reports per-class precision/recall, a confusion matrix
-  (`artifacts/confusion_matrix.png`), and the **false-positive rate on background**.
+- **Augmentation** (train split only): background noise at -5 to 20 dB SNR, gain of -9 to +6 dB,
+  and a time shift of ±250 ms. Copies are generated once and cached.
+- **Model.** DS-CNN: a 3x3 conv stem (64 filters) and five depthwise-separable blocks
+  (96/128/128/160/192 filters), then global average pooling and softmax. **99,661 parameters**
+  (~140 KB int8, 142,952 B) and ~9.5M MACs, about 2.4x the compute of the original 5-class
+  model. ReLU6 and
+  BatchNorm keep the int8 conversion clean.
+- **Training.** Adam with a decaying learning rate, label smoothing 0.05, square-root
+  inverse-frequency class weights, and early stopping on `val_loss`. It reports per-class
+  precision/recall/F1, macro F1, a confusion matrix (`artifacts/confusion_matrix.png`), the
+  **false-positive rate on background**, the false alerts per hour that implies, and a
+  threshold sweep showing what each `DETECT_THRESHOLD` would do on the test split.
 - **Export.** Writes float and int8 TFLite, and warns if int8 accuracy drops by more than 3
-  points. Also writes `model.h` (C array plus input scale and zero point) and `labels.txt`.
+  points. Also writes `model.h` (C array plus input scale and zero point) and `labels.txt`,
+  and warns when the labels or the alert tier flags differ from `protocol.h`.
+- **Latest run** (13 classes, 9,234 / 2,305 / 2,204 train / val / test windows): int8 test
+  accuracy **0.577** (float 0.572, so quantization costs nothing), background false-positive
+  rate **0.33**, macro F1 0.45. Strongest classes are background, alarm, speech, music and
+  knock; scream, car_horn and glass are the weak ones, and roughly half of FSD50K is still
+  missing from `data/FSD50K/` (5,230 zero-byte files), so retraining after re-extracting it
+  is the obvious next gain.
 
 ### Device / training contract
 
@@ -370,7 +414,8 @@ python -m unittest discover -s tests -t . -v
 ```
 
 These cover window slicing, level normalization, channel selection, and the manifest logic
-(fold mapping, per-file splits, background subsampling).
+(fold mapping, per-file splits, per-class caps, multi-label class mapping, duplicate-path and
+recording-leak checks).
 
 ## Troubleshooting
 
@@ -378,6 +423,12 @@ These cover window slicing, level normalization, channel selection, and the mani
   stripped build.
 - **`could not find the ESC-50 dataset`**: the message lists every path it tried. Set
   `paths.esc50_*` in `config.yaml` or pass `--esc50-root`.
+- **`warning: N FSD50K clip(s) are 0 bytes and were skipped`**: the FSD50K archive was not
+  fully extracted (a half-finished copy looks like this). Re-extract it into
+  `data/FSD50K/` and re-run `python scripts/prepare_datasets.py --source fsd50k`.
+- **`model.h and protocol.h list a different number of classes`**: `config.yaml` class list,
+  `protocol.h` `CLASS_NAMES`/`CLS_` and the exported `model.h` disagree. Fix the class list
+  everywhere, then re-run `python export.py --firmware-dir room_capture`.
 - **Stale features after editing `config.yaml`**: this can't happen, because the cache folder
   is keyed by the feature settings. Use `--force-features` to rebuild anyway.
 - **Out of memory**: lower `training.batch_size` and `augment.noise_pool_size`.

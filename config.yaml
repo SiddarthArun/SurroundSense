@@ -8,10 +8,17 @@ paths:
   esc50_audio_dir: data/ESC-50/audio
   esc50_meta_csv: data/ESC-50/meta/esc50.csv
 
+  # FSD50K: flat folder of <fname>.wav plus the ground-truth CSVs
+  fsd50k_audio_dir: data/FSD50K
+  fsd50k_ground_truth_dir: data/FSD50K.ground_truth
+
+  # RAVDESS speech (Actor_01/*.wav ...), used for the speech class
+  ravdess_audio_dir: data/ravdess
+
   # Stage 2 input: my_recordings_raw/<class>/<recording>.wav (any rate/channels)
   raw_recordings_dir: my_recordings_raw
 
-  # The standardized dataset folder that stage 1+2 write and stage 3 reads
+  # The standardized dataset folder that the prep stages write and training reads
   processed_dir: data/processed
   manifest_csv: data/processed/manifest.csv
 
@@ -33,13 +40,45 @@ audio:
 classes:
   background: background
 
-  # ESC-50 category -> label used in data/processed/ and on the device.
-  # Anything not listed here becomes `background`.
+  # Source category -> label. Anything not listed becomes `background`.
   esc50_map:
     siren: siren
     car_horn: car_horn
     clock_alarm: alarm
     door_wood_knock: knock
+    glass_breaking: glass
+    crying_baby: baby_cry
+    dog: dog_bark
+    thunderstorm: thunder
+
+  # FSD50K is multi-label: when a clip carries several of these labels, the one
+  # that comes first in `classes.order` wins (see train.py / prep precedence).
+  fsd50k_map:
+    Siren: siren
+    Vehicle_horn_and_car_horn_and_honking: car_horn
+    Alarm: alarm
+    Knock: knock
+    Shatter: glass
+    Screaming: scream
+    Shout: scream
+    Yell: scream
+    Screech: scream
+    Crying_and_sobbing: baby_cry
+    Bark: dog_bark
+    Dog: dog_bark
+    Growling: dog_bark
+    Gunshot_and_gunfire: gunshot
+    Thunder: thunder
+    Speech: speech
+    Male_speech_and_man_speaking: speech
+    Female_speech_and_woman_speaking: speech
+    Child_speech_and_kid_speaking: speech
+    Conversation: speech
+    Chatter: speech
+    Music: music
+
+  # Every RAVDESS clip is acted speech.
+  ravdess_label: speech
 
   # Canonical label order (index in this list = model output index for labels
   # that are present in the manifest). New classes from stage 2 recordings are
@@ -51,12 +90,47 @@ classes:
     - car_horn
     - alarm
     - knock
+    - glass
+    - scream
+    - baby_cry
+    - dog_bark
+    - gunshot
+    - thunder
+    - speech
+    - music
     - background
+
+  # Classes that buzz the wristband (libraries/protocol/protocol.h CLASS_ALERT).
+  # speech, music and background are learned so the model can explain ordinary
+  # room sound, but they are never sent as an alert.
+  alert:
+    - siren
+    - car_horn
+    - alarm
+    - knock
+    - glass
+    - scream
+    - baby_cry
+    - dog_bark
+    - gunshot
+    - thunder
 
 prepare:
   esc50_source: esc50          # value written to manifest.source for ESC-50 windows
-  own_source: own              # value written to manifest.source for own recordings
-  background_ratio: 4.0        # background windows = ratio * avg target-class windows
+  fsd50k_source: fsd50k        # ... for FSD50K windows
+  ravdess_source: ravdess      # ... for RAVDESS windows
+  own_source: own              # ... for own recordings
+  # Long clips (most FSD50K clips are 10-30 s) contribute at most this many
+  # 1 s windows, spread evenly over the clip so the event is not always at the start.
+  max_windows_per_clip: 5
+  # Per-split cap per class, applied when training. Speech and music have far
+  # more source material than a siren does, and an unbalanced softmax learns to
+  # say "music" about everything.
+  max_windows_per_class: 2000
+  # Background keeps its own, larger cap: every background window the model calls
+  # a target is a false buzz on the wristband, so it has to be the biggest class.
+  background_ratio: 8.0        # budget = ratio * average target class ...
+  max_background_windows: 6000 # ... up to this many windows per split
   overlap_seconds: 0.0         # 0 = non-overlapping windows
 
 splits:
@@ -65,12 +139,21 @@ splits:
     train: [1, 2, 3]
     val: [4]
     test: [5]
+  # FSD50K clips are assigned by clip id, RAVDESS by actor (no speaker leaks).
+  fsd50k_ratios:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  ravdess_ratios:
+    train: 0.70
+    val: 0.15
+    test: 0.15
   # Own recordings: split by source file (never by window) with these ratios.
   own_ratios:
     train: 0.70
     val: 0.15
     test: 0.15
-  seed: 42                     # used for own-recording split assignment
+  seed: 42                     # used for every split assignment and subsample
 
 features:
   # TensorFlow audio_microfrontend (the same frontend runs on the ESP32-S3)
@@ -86,20 +169,23 @@ features:
   value_scale: 255.0
 
 training:
-  batch_size: 16               # small on purpose (6 GB laptop GPU / CPU only runs)
-  epochs: 50
+  batch_size: 32
+  epochs: 60
   learning_rate: 0.001
-  patience: 10                 # early stopping on val_loss
+  label_smoothing: 0.1         # keeps the softmax from saturating on a small set
+  patience: 15                 # early stopping on val_loss
   seed: 42
-  shuffle_buffer: 1024
-  num_parallel_loads: 2
-  max_class_weight: 10.0
+  shuffle_buffer: 4096
+  num_parallel_loads: 4
+  max_class_weight: 8.0
+  param_budget: 120000         # warn above this (flash + frame time on the S3)
+  windows_per_hour: 7200       # 0.5 s hop, for the false-alert-per-hour estimate
 
 augment:
   enabled: true
   copies_per_sample: 3         # extra augmented windows generated once per train window
-  noise_snr_db: [0.0, 20.0]    # random SNR range when mixing background noise
-  noise_probability: 0.6       # fraction of copies that get noise mixed in
-  gain_db: [-6.0, 6.0]
-  shift_ms: 100.0              # random time shift within the 1 s window, +/- this
-  noise_pool_size: 192         # max background windows kept in RAM for mixing
+  noise_snr_db: [-5.0, 20.0]   # random SNR range when mixing background noise
+  noise_probability: 0.8       # fraction of copies that get noise mixed in
+  gain_db: [-9.0, 6.0]
+  shift_ms: 250.0              # random time shift within the 1 s window, +/- this
+  noise_pool_size: 256         # max background windows kept in RAM for mixing

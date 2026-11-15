@@ -5,10 +5,11 @@
   (anything unmapped becomes the background class)
 * resamples to 16 kHz mono, cuts 1 s windows, skips near-silent windows for
   target classes only, peak-normalizes and writes ``data/processed/<class>/*.wav``
-* subsamples background to ``prepare.background_ratio`` x the average target
-  class size
 * writes ``data/processed/manifest.csv`` (folds 1-3 train / 4 val / 5 test),
-  preserving rows written by stage 2 (own recordings)
+  preserving rows written by the other prep stages
+
+Every window is kept: train.py applies the per-class caps (`prepare.*`),
+so re-balancing never has to delete files.
 
 The dataset in ``data/ESC-50/`` is read-only here.
 """
@@ -80,6 +81,18 @@ def resolve_dataset(cfg: dict, esc50_root: str | None) -> tuple[Path, Path]:
     return esc50_paths(cfg)
 
 
+def esc50_group(meta: dict) -> str:
+    """The source recording a clip was cut from: <src_file>-<take>.
+
+    Several 5 s clips can come from one recording, and ESC-50 puts a few of them
+    in different folds (234879-A has one clip in fold 4 and one in fold 5). All
+    clips of one recording must share a split, or the test score is fiction.
+    """
+    src_file = str(meta.get("src_file") or Path(str(meta.get("filename", ""))).stem).strip()
+    take = str(meta.get("take") or "").strip()
+    return f"{src_file}-{take}" if take else src_file
+
+
 def clear_previous_esc50_windows(processed_dir: Path, source: str) -> int:
     """Delete wavs from an earlier run so stale windows cannot survive."""
     removed = 0
@@ -146,6 +159,22 @@ def main(argv: list[str] | None = None) -> int:
             )
     meta_rows = all_meta_rows[: args.limit] if args.limit else all_meta_rows
 
+    # A recording's split is decided by its first clip; clips of the same
+    # recording that ESC-50 put in another fold follow it.
+    group_split: dict[str, str] = {}
+    regrouped = 0
+    for meta in meta_rows:
+        try:
+            fold = int(str(meta["fold"]).strip())
+            split = manifest.split_for_esc50_fold(fold, fold_map)
+        except (ValueError, manifest.ManifestError):
+            continue  # reported in the main loop
+        group = esc50_group(meta)
+        if group in group_split:
+            regrouped += int(group_split[group] != split)
+        else:
+            group_split[group] = split
+
     own_rows = [row for row in manifest.read_manifest(manifest_path) if row["source"] != source]
     removed = clear_previous_esc50_windows(processed_dir, source)
     if removed:
@@ -178,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         except manifest.ManifestError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        split = group_split.get(esc50_group(meta), split)
 
         clip_path = audio_dir / filename
         try:
@@ -186,11 +216,10 @@ def main(argv: list[str] | None = None) -> int:
             failed.append((clip_path, str(exc)))
             continue
 
-        file_id = str(meta.get("src_file") or Path(filename).stem).strip()
-        take = str(meta.get("take") or "").strip()
-        if take:
-            file_id = f"{file_id}-{take}"
-        file_id = file_id.replace(" ", "_")
+        file_id = esc50_group(meta).replace(" ", "")
+        # The window name carries the clip's own file name: one recording can be
+        # cut into several clips, and they must not overwrite each other.
+        window_stem = Path(filename).stem
 
         windows = audio.slice_windows(mono, window_samples, hop_samples)
         for window_index, window in enumerate(windows):
@@ -202,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
                 skipped_silence_background += 1
                 continue
             normalized = audio.peak_normalize(window, peak_target, max_gain_db)
-            out_path = processed_dir / label / f"{source}_{file_id}_w{window_index:03d}.wav"
+            out_path = processed_dir / label / f"{source}_{window_stem}_w{window_index:03d}.wav"
             try:
                 audio.write_wav(out_path, normalized, sample_rate)
             except audio.AudioError as exc:
@@ -231,28 +260,18 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no windows were produced - check the ESC-50 path and config", file=sys.stderr)
         return 2
 
-    target_labels = sorted({row["class"] for row in rows if row["class"] != background})
-    kept_rows, stats = manifest.subsample_background(
-        rows,
-        ratio=cfg["prepare"]["background_ratio"],
-        seed=cfg["splits"]["seed"],
-        background_label=background,
-        target_labels=target_labels,
-    )
-    if stats["budget"] < stats["background_available"]:
-        dropped_paths = {row["path"] for row in rows} - {row["path"] for row in kept_rows}
-        for rel_path in dropped_paths:
-            (PROJECT_ROOT / rel_path).unlink(missing_ok=True)
-        print(
-            f"\nbackground: kept {stats['background_kept']} of "
-            f"{stats['background_available']} windows "
-            f"({cfg['prepare']['background_ratio']:g}x average target class = {stats['budget']})"
-        )
-
-    all_rows = own_rows + kept_rows
+    # Every window is kept here; train.py caps each class when it builds the
+    # training set, so re-balancing never has to delete files (and a window can
+    # never end up as two rows in two different splits).
+    all_rows = own_rows + rows
     written = manifest.write_manifest(manifest_path, all_rows)
-    summarize(kept_rows, sorted({row["class"] for row in kept_rows}))
+    summarize(rows, sorted({row["class"] for row in rows}))
 
+    if regrouped:
+        print(
+            f"\n{regrouped} clip(s) moved to their recording's split: ESC-50 had cut them "
+            "from a recording already used in another fold"
+        )
     print(f"\nskipped {skipped_silent} silent background window(s) [digital silence]")
     print(f"skipped {skipped_silence_background} near-silent target window(s) (rms < {silence_rms})")
     print(f"manifest: {manifest_path} ({written} row(s), {len(own_rows)} kept from own recordings)")
